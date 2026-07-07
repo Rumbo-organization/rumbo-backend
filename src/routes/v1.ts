@@ -664,7 +664,60 @@ v1.get('/contacts', async (req, res, next) => {
     res.json(out);
   } catch (err) { next(err); }
 });
-v1.get('/vencimientos', section('VENCIMIENTOS'));
+// Vencimientos paginado server-side (Fase 4 escalabilidad): pólizas con fecha de
+// fin, ordenadas por renovación, filtradas por ventana (30/90/todo) y forma de
+// pago. Devuelve { data, total, totalPrima, counts, limit, offset }. Misma forma
+// de fila que POLICIES; el frontend calcula los días y agrupa por mes. RLS por org.
+v1.get('/vencimientos', async (req, res, next) => {
+  const windowDays = req.query.window === '30' ? 30 : req.query.window === '90' ? 90 : null;
+  const pay = typeof req.query.pay === 'string' ? req.query.pay : '';
+  const limit = Math.min(Math.max(parseInt(String(req.query.limit ?? '50'), 10) || 50, 1), 200);
+  const offset = Math.max(parseInt(String(req.query.offset ?? '0'), 10) || 0, 0);
+
+  try {
+    const out = await withAuthedTx(req.authCtx!, async (tx) => {
+      const conds = [sql`${policies.endDate} is not null`];
+      if (windowDays) conds.push(sql`(${policies.endDate} - current_date) <= ${windowDays}`);
+      if (pay === '__none__') conds.push(sql`${policies.paymentMethod} is null`);
+      else if (pay && PAYMENT_METHOD_LABEL[pay]) conds.push(sql`${policies.paymentMethod} = ${pay}`);
+      const where = and(...conds);
+
+      const rows = await tx
+        .select(policyRowSelect)
+        .from(policies)
+        .leftJoin(insurers, eq(insurers.id, policies.insurerId))
+        .leftJoin(contacts, eq(contacts.id, policies.contactId))
+        .where(where)
+        .orderBy(asc(policies.endDate))
+        .limit(limit)
+        .offset(offset);
+
+      const agg = (await tx
+        .select({ total: sql<number>`count(*)::int`, totalPrima: sql<number>`coalesce(sum(${policies.prima}), 0)::float8` })
+        .from(policies)
+        .where(where))[0];
+
+      // Conteos por ventana (ignoran el filtro de pago, como los chips actuales).
+      const counts = (await tx.execute(sql`
+        select
+          count(*) filter (where (end_date - current_date) <= 30)::int as d30,
+          count(*) filter (where (end_date - current_date) <= 90)::int as d90,
+          count(*)::int as all_count
+        from policies where end_date is not null
+      `)).rows[0] as unknown as { d30: number; d90: number; all_count: number };
+
+      return {
+        data: rows.map(mapPolicyRow),
+        total: agg?.total ?? 0,
+        totalPrima: agg?.totalPrima ?? 0,
+        counts: { d30: counts?.d30 ?? 0, d90: counts?.d90 ?? 0, all: counts?.all_count ?? 0 },
+        limit,
+        offset,
+      };
+    });
+    res.json(out);
+  } catch (err) { next(err); }
+});
 v1.get('/siniestros', section('SINIESTROS'));
 v1.get('/cuotas', section('CUOTAS'));
 v1.get('/crossselling', section('CROSSSELL'));

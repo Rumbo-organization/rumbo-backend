@@ -79,12 +79,14 @@ export const auth = betterAuth({
   },
 
   advanced: {
-    // A02/A05 (OWASP): en prod la cookie de sesión va secure + httpOnly +
-    // sameSite (SPA y API same-origin). En local queda sin secure para http.
+    // A02/A05 (OWASP): en prod la cookie de sesión va secure + httpOnly.
+    // SPA y API viven en dominios Vercel distintos ⇒ cookie cross-site:
+    // sameSite='none'+secure en prod para que el fetch con credentials la mande.
+    // En local (http) queda 'lax' sin secure (los browsers rechazan None sin secure).
     useSecureCookies: IS_PROD,
     defaultCookieAttributes: {
       httpOnly: true,
-      sameSite: 'lax',
+      sameSite: IS_PROD ? 'none' : 'lax',
       secure: IS_PROD,
     },
     database: {

@@ -308,6 +308,7 @@ async function assembleCockpit(tx: AuthedTx, now: Date) {
       stale: Math.max(0, stale),
       opened: c.occurredAt.toISOString().slice(0, 10),
       insurer: (p?.insurerId && insurerName.get(p.insurerId)) || '—',
+      ramo: p ? ramoLabel(p.ramo) : '—',
     };
   });
 

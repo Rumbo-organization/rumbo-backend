@@ -1,4 +1,4 @@
-import { ALLOWED_ORIGINS } from './env.js';
+import { ALLOWED_ORIGINS, BETTER_AUTH_SECRET, IS_PROD } from './env.js';
 import { betterAuth } from 'better-auth';
 import { drizzleAdapter } from 'better-auth/adapters/drizzle';
 import { organization, twoFactor } from 'better-auth/plugins';
@@ -27,11 +27,22 @@ export const auth = betterAuth({
       twoFactor: schema.twoFactors,
     },
   }),
-  // Solo cae en el fallback si falta la env var (nunca usar en producción).
-  secret: process.env.BETTER_AUTH_SECRET ?? 'dev-only-secret-cambiar',
+  // env.ts ya garantiza que en prod BETTER_AUTH_SECRET exista; el fallback solo
+  // es alcanzable en local/Docker (A02 OWASP).
+  secret: BETTER_AUTH_SECRET ?? 'dev-only-secret-cambiar',
   baseURL: process.env.BETTER_AUTH_URL ?? 'http://localhost:4000',
   trustedOrigins: ALLOWED_ORIGINS,
   emailAndPassword: { enabled: true },
+
+  // A07 (OWASP): rate limiting anti fuerza bruta sobre los endpoints de auth
+  // (login/signup/2fa). Storage en memoria por instancia (suficiente para
+  // local/Docker; en serverless es por-instancia — endurecer con storage
+  // compartido si se escala).
+  rateLimit: {
+    enabled: true,
+    window: 60, // segundos
+    max: 30, // requests por IP por ventana
+  },
   socialProviders:
     process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET
       ? {
@@ -68,6 +79,14 @@ export const auth = betterAuth({
   },
 
   advanced: {
+    // A02/A05 (OWASP): en prod la cookie de sesión va secure + httpOnly +
+    // sameSite (SPA y API same-origin). En local queda sin secure para http.
+    useSecureCookies: IS_PROD,
+    defaultCookieAttributes: {
+      httpOnly: true,
+      sameSite: 'lax',
+      secure: IS_PROD,
+    },
     database: {
       generateId: 'uuid',
     },

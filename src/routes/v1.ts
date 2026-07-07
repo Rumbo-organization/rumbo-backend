@@ -211,6 +211,13 @@ async function assembleCockpit(tx: AuthedTx, now: Date) {
     .orderBy(desc(auditLog.createdAt))
     .limit(40);
 
+  // Totales reales por tabla (bajo RLS = solo esta org). Sirven para avisar en el
+  // frontend cuando una lista viene capada por LIMIT (ver roadmap/PLAN-ESCALABILIDAD.md).
+  // Secuenciales: la tx usa una sola conexión (no Promise.all).
+  const totalContacts = (await tx.select({ n: sql<number>`count(*)::int` }).from(contacts))[0]?.n ?? 0;
+  const totalPolicies = (await tx.select({ n: sql<number>`count(*)::int` }).from(policies))[0]?.n ?? 0;
+  const totalClaims = (await tx.select({ n: sql<number>`count(*)::int` }).from(claims))[0]?.n ?? 0;
+
   // ---- contactos ----
   const contactById = new Map(contactRows.map((c) => [c.id, c]));
   const CONTACTS = contactRows.map((c) => {
@@ -489,6 +496,13 @@ async function assembleCockpit(tx: AuthedTx, now: Date) {
     COTIZACIONES,
     PRODUCTORES,
     AUDIT,
+    // Totales reales vs lo que viaja en el payload (capado por LIMIT). El frontend
+    // avisa "mostrando X de N" cuando shown < total. Ver roadmap/PLAN-ESCALABILIDAD.md.
+    COUNTS: {
+      contacts: { shown: CONTACTS.length, total: totalContacts },
+      policies: { shown: POLICIES.length, total: totalPolicies },
+      claims: { shown: SINIESTROS.length, total: totalClaims },
+    },
   };
 }
 

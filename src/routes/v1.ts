@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { and, asc, desc, eq, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, sql } from 'drizzle-orm';
 
 import { requireAuthedOrg } from '../middleware/authed.js';
 import { withAuthedTx, schema, type AuthedTx } from '../db/client.js';
@@ -335,13 +335,7 @@ async function assembleCockpit(tx: AuthedTx, now: Date) {
     set.add(p.ramo);
     ramosByContact.set(p.contactId, set);
   }
-  const CROSS_RULES = [
-    { have: 'automotor', lack: 'hogar', suggest: 'Hogar', reason: 'Tiene Automotor, sin cobertura de vivienda', score: 'Alta' },
-    { have: 'automotor', lack: 'vida', suggest: 'Vida', reason: 'Tiene Automotor, sin seguro de vida', score: 'Media' },
-    { have: 'hogar', lack: 'automotor', suggest: 'Automotor', reason: 'Tiene Hogar, sin cobertura de vehículo', score: 'Media' },
-    { have: 'comercio', lack: 'automotor', suggest: 'Automotor', reason: 'Tiene Comercio, sin flota asegurada', score: 'Media' },
-    { have: 'art', lack: 'incendio', suggest: 'Integral', reason: 'Tiene ART, planta sin cobertura de incendio', score: 'Alta' },
-  ];
+  // CROSS_RULES: módulo-level (compartidas con la ficha del contacto).
   const CROSSSELL: object[] = [];
   for (const [contactId, ramos] of ramosByContact) {
     for (const rule of CROSS_RULES) {
@@ -570,7 +564,74 @@ v1.get('/bootstrap', handle(async (tx, ctx) => {
 const section = (key: string) =>
   handle(async (tx) => ({ data: (await assembleCockpit(tx, new Date()))[key as keyof Awaited<ReturnType<typeof assembleCockpit>>] }));
 
-v1.get('/contacts', section('CONTACTS'));
+// Asegurados/contactos paginado server-side (Fase 2 escalabilidad,
+// roadmap/PLAN-ESCALABILIDAD.md): búsqueda (nombre/DNI/CUIT/ciudad), filtro por
+// segmento (asegurado/prospecto/empresa), orden y paginación en SQL. Agrega por
+// contacto el nº de pólizas y los días al próximo vencimiento (para la lista). El
+// resumen/ficha se pide aparte por /contacts/:id. RLS por org.
+v1.get('/contacts', async (req, res, next) => {
+  const qStr = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+  const seg = typeof req.query.seg === 'string' ? req.query.seg : 'todos';
+  const dir = req.query.dir === 'desc' ? 'desc' : 'asc';
+  const limit = Math.min(Math.max(parseInt(String(req.query.limit ?? '50'), 10) || 50, 1), 200);
+  const offset = Math.max(parseInt(String(req.query.offset ?? '0'), 10) || 0, 0);
+
+  try {
+    const out = await withAuthedTx(req.authCtx!, async (tx) => {
+      const conds = [];
+      if (qStr) {
+        const like = `%${qStr}%`;
+        conds.push(sql`(
+          ${contacts.firstName} ilike ${like}
+          or ${contacts.lastName} ilike ${like}
+          or ${contacts.legalName} ilike ${like}
+          or ${contacts.dni} ilike ${like}
+          or ${contacts.cuit} ilike ${like}
+          or ${contacts.addressCity} ilike ${like}
+        )`);
+      }
+      if (seg === 'clientes') conds.push(eq(contacts.status, 'asegurado'));
+      else if (seg === 'prospectos') conds.push(eq(contacts.status, 'prospecto'));
+      else if (seg === 'empresas') conds.push(eq(contacts.kind, 'PERSONA_JURIDICA'));
+      const where = conds.length ? and(...conds) : undefined;
+
+      const orderExpr = sql`coalesce(${contacts.legalName}, ${contacts.lastName}, ${contacts.firstName})`;
+
+      const rows = await tx
+        .select({
+          c: contacts,
+          polCount: sql<number>`(select count(*)::int from ${policies} p where p.contact_id = ${contacts.id})`,
+          nextRenewDays: sql<number | null>`(select min(p.end_date - current_date)::int from ${policies} p where p.contact_id = ${contacts.id} and p.end_date is not null)`,
+        })
+        .from(contacts)
+        .where(where)
+        .orderBy(dir === 'desc' ? desc(orderExpr) : asc(orderExpr))
+        .limit(limit)
+        .offset(offset);
+
+      const total = (await tx.select({ n: sql<number>`count(*)::int` }).from(contacts).where(where))[0]?.n ?? 0;
+
+      const data = rows.map(({ c, polCount, nextRenewDays }) => {
+        const name = displayName(c);
+        return {
+          id: c.id,
+          name,
+          initials: initialsOf(name),
+          kind: c.kind === 'PERSONA_JURIDICA' ? 'Empresa' : 'Persona',
+          city: c.addressCity ?? '—',
+          phone: firstPhone(c.contactMethods),
+          document: c.dni ? `DNI ${c.dni}` : c.cuit ? `CUIT ${c.cuit}` : null,
+          since: String(c.createdAt.getFullYear()),
+          tags: c.status === 'prospecto' ? ['Prospecto'] : c.status === 'exasegurado' ? ['Ex asegurado'] : ['Asegurado'],
+          polCount: polCount ?? 0,
+          nextRenewDays: nextRenewDays,
+        };
+      });
+      return { data, total, limit, offset };
+    });
+    res.json(out);
+  } catch (err) { next(err); }
+});
 v1.get('/vencimientos', section('VENCIMIENTOS'));
 v1.get('/siniestros', section('SINIESTROS'));
 v1.get('/cuotas', section('CUOTAS'));
@@ -601,6 +662,58 @@ const POLICY_SORT_COL: Record<string, unknown> = {
 };
 const freqFromCount = (n: number): string =>
   n >= 10 ? 'Mensual' : n >= 4 ? 'Trimestral' : n >= 2 ? 'Semestral' : 'Anual';
+
+// Select + mapper de una fila de póliza — compartido por el listado paginado de
+// pólizas y por la ficha del contacto (para no traer la lista completa ni pasar
+// por assembleCockpit). Subconsultas correlacionadas: freq (nº de cuotas) y el
+// detalle del riesgo. Se lee con leftJoin a insurers + contacts.
+const policyRowSelect = {
+  p: policies,
+  insurerName: insurers.name,
+  cKind: contacts.kind,
+  firstName: contacts.firstName,
+  lastName: contacts.lastName,
+  legalName: contacts.legalName,
+  instCount: sql<number>`(select count(*)::int from ${policyInstallments} pi where pi.policy_id = ${policies.id})`,
+  riskLabel: sql<string | null>`(select (r.descripcion || case when r.patente is not null then ' · ' || r.patente else '' end) from ${policyRisks} r where r.policy_id = ${policies.id} limit 1)`,
+};
+type PolicyRowRaw = {
+  p: typeof policies.$inferSelect;
+  insurerName: string | null; cKind: string | null;
+  firstName: string | null; lastName: string | null; legalName: string | null;
+  instCount: number | null; riskLabel: string | null;
+};
+function mapPolicyRow(r: PolicyRowRaw) {
+  const p = r.p;
+  const client = displayName({ kind: r.cKind ?? 'PERSONA_FISICA', firstName: r.firstName, lastName: r.lastName, legalName: r.legalName });
+  return {
+    id: p.id,
+    num: p.policyNumber ?? '—',
+    contactId: p.contactId,
+    client,
+    insurer: r.insurerName ?? '—',
+    ramo: ramoLabel(p.ramo),
+    detail: r.riskLabel ?? p.notes ?? ramoLabel(p.ramo),
+    prima: num(p.prima),
+    freq: freqFromCount(r.instCount ?? 0),
+    status: POLICY_STATUS_LABEL[p.status] ?? p.status,
+    start: p.startDate,
+    renew: p.endDate,
+    coverage: p.notes ?? '—',
+    paymentMethod: paymentLabel(p.paymentMethod),
+    sumaAseg: p.sumaAsegurada == null ? null : num(p.sumaAsegurada),
+  };
+}
+
+// Reglas de cross-sell (ramo que tiene → ramo que le falta). Módulo-level para
+// reusarlas en el cockpit y en la ficha del contacto.
+const CROSS_RULES = [
+  { have: 'automotor', lack: 'hogar', suggest: 'Hogar', reason: 'Tiene Automotor, sin cobertura de vivienda', score: 'Alta' },
+  { have: 'automotor', lack: 'vida', suggest: 'Vida', reason: 'Tiene Automotor, sin seguro de vida', score: 'Media' },
+  { have: 'hogar', lack: 'automotor', suggest: 'Automotor', reason: 'Tiene Hogar, sin cobertura de vehículo', score: 'Media' },
+  { have: 'comercio', lack: 'automotor', suggest: 'Automotor', reason: 'Tiene Comercio, sin flota asegurada', score: 'Media' },
+  { have: 'art', lack: 'incendio', suggest: 'Integral', reason: 'Tiene ART, planta sin cobertura de incendio', score: 'Alta' },
+];
 
 v1.get('/policies', async (req, res, next) => {
   const qStr = typeof req.query.q === 'string' ? req.query.q.trim() : '';
@@ -638,16 +751,7 @@ v1.get('/policies', async (req, res, next) => {
         : (POLICY_SORT_COL[sortKey] ?? policies.endDate);
 
       const rows = await tx
-        .select({
-          p: policies,
-          insurerName: insurers.name,
-          cKind: contacts.kind,
-          firstName: contacts.firstName,
-          lastName: contacts.lastName,
-          legalName: contacts.legalName,
-          instCount: sql<number>`(select count(*)::int from ${policyInstallments} pi where pi.policy_id = ${policies.id})`,
-          riskLabel: sql<string | null>`(select (r.descripcion || case when r.patente is not null then ' · ' || r.patente else '' end) from ${policyRisks} r where r.policy_id = ${policies.id} limit 1)`,
-        })
+        .select(policyRowSelect)
         .from(policies)
         .leftJoin(insurers, eq(insurers.id, policies.insurerId))
         .leftJoin(contacts, eq(contacts.id, policies.contactId))
@@ -664,27 +768,7 @@ v1.get('/policies', async (req, res, next) => {
         .leftJoin(contacts, eq(contacts.id, policies.contactId))
         .where(where))[0]?.n ?? 0;
 
-      const data = rows.map((r) => {
-        const p = r.p;
-        const name = displayName({ kind: r.cKind ?? 'PERSONA_FISICA', firstName: r.firstName, lastName: r.lastName, legalName: r.legalName });
-        return {
-          id: p.id,
-          num: p.policyNumber ?? '—',
-          contactId: p.contactId,
-          client: name,
-          insurer: r.insurerName ?? '—',
-          ramo: ramoLabel(p.ramo),
-          detail: r.riskLabel ?? p.notes ?? ramoLabel(p.ramo),
-          prima: num(p.prima),
-          freq: freqFromCount(r.instCount ?? 0),
-          status: POLICY_STATUS_LABEL[p.status] ?? p.status,
-          start: p.startDate,
-          renew: p.endDate,
-          coverage: p.notes ?? '—',
-          paymentMethod: paymentLabel(p.paymentMethod),
-          sumaAseg: p.sumaAsegurada == null ? null : num(p.sumaAsegurada),
-        };
-      });
+      const data = rows.map(mapPolicyRow);
       return { data, total, limit, offset };
     });
     res.json(out);
@@ -731,17 +815,65 @@ v1.get('/contacts/:id', async (req, res, next) => {
       const [c] = await tx.select().from(contacts).where(eq(contacts.id, req.params.id)).limit(1);
       if (!c) return null;
 
-      const cockpit = await assembleCockpit(tx, new Date());
-      const polizas = (cockpit.POLICIES as Array<{ id: string; contactId: string | null; prima: number; freq: string }>).filter(
-        (p) => p.contactId === c.id,
-      );
-      const polIds = new Set(polizas.map((p) => p.id));
-      const siniestros = (cockpit.SINIESTROS as Array<{ policyId: string | null }>).filter(
-        (s) => s.policyId != null && polIds.has(s.policyId),
-      );
-      const crosssell = (cockpit.CROSSSELL as Array<{ contactId?: string }>).filter((x) => x.contactId === c.id);
-
       const name = displayName(c);
+
+      // Pólizas del contacto — consulta directa (sin assembleCockpit → no capa por
+      // LIMIT y no rearma todo el cockpit). Misma forma de fila que POLICIES.
+      const polRows = await tx
+        .select(policyRowSelect)
+        .from(policies)
+        .leftJoin(insurers, eq(insurers.id, policies.insurerId))
+        .leftJoin(contacts, eq(contacts.id, policies.contactId))
+        .where(eq(policies.contactId, c.id))
+        .orderBy(asc(policies.endDate));
+      const polizas = polRows.map(mapPolicyRow);
+      const polIds = polizas.map((p) => p.id);
+
+      // Siniestros de esas pólizas (misma forma que SINIESTROS del cockpit).
+      const claimRows = polIds.length
+        ? await tx
+            .select({
+              cl: claims,
+              stale: sql<number>`floor(extract(epoch from (now() - ${claims.lastActivityAt})) / 86400)::int`,
+              insurerName: insurers.name,
+            })
+            .from(claims)
+            .leftJoin(policies, eq(policies.id, claims.policyId))
+            .leftJoin(insurers, eq(insurers.id, policies.insurerId))
+            .where(inArray(claims.policyId, polIds))
+            .orderBy(desc(claims.lastActivityAt))
+        : [];
+      const siniestros = claimRows.map(({ cl, stale, insurerName }) => ({
+        id: cl.id,
+        tipo: CLAIM_TIPO_LABEL[cl.tipo] ?? cl.tipo,
+        client: name,
+        policyId: cl.policyId,
+        num: cl.claimNumber ?? '—',
+        status: CLAIM_STATUS_LABEL[cl.status] ?? cl.status,
+        importance: cl.importance ? CLAIM_IMPORTANCE_LABEL[cl.importance] ?? cl.importance : null,
+        reportedBy: cl.reportedBy,
+        stale: Math.max(0, stale),
+        opened: cl.occurredAt.toISOString().slice(0, 10),
+        insurer: insurerName ?? '—',
+      }));
+
+      // Cross-sell: reglas sobre los ramos (crudos) que tiene el contacto.
+      const ramos = new Set<string>(polRows.map((r) => r.p.ramo));
+      const crosssell: object[] = [];
+      for (const rule of CROSS_RULES) {
+        if (ramos.has(rule.have) && !ramos.has(rule.lack)) {
+          crosssell.push({
+            id: `x-${c.id}-${rule.suggest}`,
+            client: name,
+            contactId: c.id,
+            has: [...ramos].map(ramoLabel),
+            suggest: rule.suggest,
+            reason: rule.reason,
+            score: rule.score,
+          });
+          break;
+        }
+      }
       const addressLine = [
         [c.addressStreet, c.addressNumber].filter(Boolean).join(' '),
         [c.addressFloor, c.addressApartment].filter(Boolean).join(' '),

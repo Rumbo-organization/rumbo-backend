@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { asc, desc, eq, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, sql } from 'drizzle-orm';
 
 import { requireAuthedOrg } from '../middleware/authed.js';
 import { withAuthedTx, schema, type AuthedTx } from '../db/client.js';
@@ -571,7 +571,6 @@ const section = (key: string) =>
   handle(async (tx) => ({ data: (await assembleCockpit(tx, new Date()))[key as keyof Awaited<ReturnType<typeof assembleCockpit>>] }));
 
 v1.get('/contacts', section('CONTACTS'));
-v1.get('/policies', section('POLICIES'));
 v1.get('/vencimientos', section('VENCIMIENTOS'));
 v1.get('/siniestros', section('SINIESTROS'));
 v1.get('/cuotas', section('CUOTAS'));
@@ -588,6 +587,109 @@ v1.get('/quotes', section('COTIZACIONES'));
 
 // KPIs agregados del dashboard.
 v1.get('/book', handle(async (tx) => (await assembleCockpit(tx, new Date())).BOOK));
+
+// Pólizas paginado server-side (Fase 1 escalabilidad, roadmap/PLAN-ESCALABILIDAD.md):
+// búsqueda, filtro por segmento/forma de pago, orden y paginación en SQL. Misma
+// forma de fila que un item de POLICIES del cockpit. RLS por org. Devuelve
+// { data, total, limit, offset } para que el frontend pagine sin traer todo.
+const POLICY_SORT_COL: Record<string, unknown> = {
+  num: policies.policyNumber,
+  ramo: policies.ramo,
+  prima: policies.prima,
+  renew: policies.endDate,
+  status: policies.status,
+};
+const freqFromCount = (n: number): string =>
+  n >= 10 ? 'Mensual' : n >= 4 ? 'Trimestral' : n >= 2 ? 'Semestral' : 'Anual';
+
+v1.get('/policies', async (req, res, next) => {
+  const qStr = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+  const seg = typeof req.query.seg === 'string' ? req.query.seg : 'todas';
+  const pay = typeof req.query.pay === 'string' ? req.query.pay : '';
+  const sortKey = typeof req.query.sort === 'string' ? req.query.sort : 'renew';
+  const dir = req.query.dir === 'desc' ? 'desc' : 'asc';
+  const limit = Math.min(Math.max(parseInt(String(req.query.limit ?? '50'), 10) || 50, 1), 200);
+  const offset = Math.max(parseInt(String(req.query.offset ?? '0'), 10) || 0, 0);
+
+  try {
+    const out = await withAuthedTx(req.authCtx!, async (tx) => {
+      const conds = [];
+      if (qStr) {
+        const like = `%${qStr}%`;
+        conds.push(sql`(
+          ${policies.policyNumber} ilike ${like}
+          or ${policies.ramo}::text ilike ${like}
+          or ${policies.notes} ilike ${like}
+          or ${insurers.name} ilike ${like}
+          or ${contacts.firstName} ilike ${like}
+          or ${contacts.lastName} ilike ${like}
+          or ${contacts.legalName} ilike ${like}
+        )`);
+      }
+      if (seg === 'porvencer') conds.push(sql`(${policies.endDate} - current_date) <= 30`);
+      else if (seg === 'siniestro') conds.push(sql`exists (select 1 from ${claims} cl where cl.policy_id = ${policies.id})`);
+      else if (seg === 'flota') conds.push(sql`(${policies.notes} ilike '%flota%' or exists (select 1 from ${policyRisks} r where r.policy_id = ${policies.id} and r.descripcion ilike '%flota%'))`);
+      if (pay && PAYMENT_METHOD_LABEL[pay]) conds.push(sql`${policies.paymentMethod} = ${pay}`);
+      const where = conds.length ? and(...conds) : undefined;
+
+      const orderExpr =
+        sortKey === 'client' ? sql`coalesce(${contacts.legalName}, ${contacts.lastName}, ${contacts.firstName})`
+        : sortKey === 'insurer' ? insurers.name
+        : (POLICY_SORT_COL[sortKey] ?? policies.endDate);
+
+      const rows = await tx
+        .select({
+          p: policies,
+          insurerName: insurers.name,
+          cKind: contacts.kind,
+          firstName: contacts.firstName,
+          lastName: contacts.lastName,
+          legalName: contacts.legalName,
+          instCount: sql<number>`(select count(*)::int from ${policyInstallments} pi where pi.policy_id = ${policies.id})`,
+          riskLabel: sql<string | null>`(select (r.descripcion || case when r.patente is not null then ' · ' || r.patente else '' end) from ${policyRisks} r where r.policy_id = ${policies.id} limit 1)`,
+        })
+        .from(policies)
+        .leftJoin(insurers, eq(insurers.id, policies.insurerId))
+        .leftJoin(contacts, eq(contacts.id, policies.contactId))
+        .where(where)
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        .orderBy(dir === 'desc' ? desc(orderExpr as any) : asc(orderExpr as any))
+        .limit(limit)
+        .offset(offset);
+
+      const total = (await tx
+        .select({ n: sql<number>`count(*)::int` })
+        .from(policies)
+        .leftJoin(insurers, eq(insurers.id, policies.insurerId))
+        .leftJoin(contacts, eq(contacts.id, policies.contactId))
+        .where(where))[0]?.n ?? 0;
+
+      const data = rows.map((r) => {
+        const p = r.p;
+        const name = displayName({ kind: r.cKind ?? 'PERSONA_FISICA', firstName: r.firstName, lastName: r.lastName, legalName: r.legalName });
+        return {
+          id: p.id,
+          num: p.policyNumber ?? '—',
+          contactId: p.contactId,
+          client: name,
+          insurer: r.insurerName ?? '—',
+          ramo: ramoLabel(p.ramo),
+          detail: r.riskLabel ?? p.notes ?? ramoLabel(p.ramo),
+          prima: num(p.prima),
+          freq: freqFromCount(r.instCount ?? 0),
+          status: POLICY_STATUS_LABEL[p.status] ?? p.status,
+          start: p.startDate,
+          renew: p.endDate,
+          coverage: p.notes ?? '—',
+          paymentMethod: paymentLabel(p.paymentMethod),
+          sumaAseg: p.sumaAsegurada == null ? null : num(p.sumaAsegurada),
+        };
+      });
+      return { data, total, limit, offset };
+    });
+    res.json(out);
+  } catch (err) { next(err); }
+});
 
 // Póliza individual (misma forma que un item de POLICIES; 404 si no es de la org).
 v1.get('/policies/:id', async (req, res, next) => {

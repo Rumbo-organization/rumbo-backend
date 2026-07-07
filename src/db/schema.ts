@@ -21,6 +21,7 @@ import {
   integer,
   numeric,
   date,
+  time,
   timestamp,
   jsonb,
   index,
@@ -1325,3 +1326,57 @@ export const waitlist = pgTable("waitlist", {
     .notNull()
     .defaultNow(),
 });
+
+// ── Calendario (jul-2026) ────────────────────────────────────────────────────
+//
+// Agenda propia del PAS: llamadas, reuniones, trámites — con vínculo opcional
+// a asegurado/póliza. Los vencimientos/cuotas/siniestros que muestra el
+// calendario son DERIVADOS de sus tablas (no se duplican); acá solo vive lo
+// que el usuario agenda a mano. producer_id: dueño del evento (sistema de
+// roles) — se estampa server-side al crear. Portado 1:1 de la app v0.1
+// (migración drizzle 0052): la DDL + RLS vive en migrations/0001_calendar_events.sql.
+export const calendarEventKind = pgEnum("calendar_event_kind", [
+  "llamada",
+  "reunion",
+  "tramite",
+  "otro",
+]);
+
+export const calendarEvents = pgTable(
+  "calendar_events",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    orgId: uuid("org_id")
+      .notNull()
+      .references(() => organizations.id, { onDelete: "cascade" }),
+    // set null: borrar un productor no borra su agenda (la hereda la org).
+    producerId: uuid("producer_id").references(() => producers.id, {
+      onDelete: "set null",
+    }),
+    createdByUserId: uuid("created_by_user_id").references(() => users.id, {
+      onDelete: "set null",
+    }),
+    kind: calendarEventKind("kind").notNull().default("otro"),
+    title: text("title").notNull(),
+    notes: text("notes"),
+    date: date("date").notNull(),
+    time: time("time"), // null = todo el día
+    contactId: uuid("contact_id").references(() => contacts.id, {
+      onDelete: "cascade",
+    }),
+    policyId: uuid("policy_id").references(() => policies.id, {
+      onDelete: "cascade",
+    }),
+    // Check de "hecho" de la agenda (tachado en la UI). null = pendiente.
+    completedAt: timestamp("completed_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    index("calendar_events_org_date_idx").on(table.orgId, table.date),
+  ],
+);

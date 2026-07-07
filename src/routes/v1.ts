@@ -3,6 +3,8 @@ import { asc, desc, eq, sql } from 'drizzle-orm';
 
 import { requireAuthedOrg } from '../middleware/authed.js';
 import { withAuthedTx, schema, type AuthedTx } from '../db/client.js';
+import { calendar } from './calendar.js';
+import { claimsRouter } from './claims.js';
 
 const {
   auditLog,
@@ -493,6 +495,15 @@ const ROLE_LABEL: Record<string, string> = {
 export const v1 = Router();
 v1.use(requireAuthedOrg);
 
+// Calendario (jul-2026): month view (4 fuentes derivadas) + CRUD de la agenda.
+// Primer camino de escritura del backend. Hereda requireAuthedOrg de este router.
+v1.use('/calendar', calendar);
+
+// Siniestros — escrituras (gestión). PATCH /claims/:id/status. La lectura de la
+// lista sigue en v1.get('/claims') (alias del cockpit) más abajo; este router no
+// define GET '/', así que esa ruta cae al handler de lectura.
+v1.use('/claims', claimsRouter);
+
 // Corre fn dentro de withAuthedTx y responde JSON; centraliza el try/catch.
 function handle<T>(fn: (tx: AuthedTx, ctx: NonNullable<import('../db/client.js').AuthContext>) => Promise<T>) {
   return async (req: import('express').Request, res: import('express').Response, next: import('express').NextFunction) => {
@@ -554,6 +565,89 @@ v1.get('/policies/:id', async (req, res, next) => {
       return;
     }
     res.json(p);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Ficha 360° del asegurado (F-011 del legacy): datos propios del contacto +
+// derivados (pólizas, siniestros, cross-sell). RLS: un id que no sea de la
+// org/cartera de la sesión no devuelve fila → 404. Así la ficha SOLO expone
+// datos propios; el id de la URL nunca alcanza para ver ajeno.
+const CONTACT_STATUS_LABEL: Record<string, string> = {
+  prospecto: 'Prospecto',
+  asegurado: 'Cliente',
+  exasegurado: 'Ex cliente',
+};
+const METHOD_TYPE_LABEL: Record<string, string> = {
+  telefono: 'Teléfono',
+  celular: 'Celular',
+  email: 'Email',
+  whatsapp: 'WhatsApp',
+};
+const FREQ_MULT: Record<string, number> = { Mensual: 12, Trimestral: 4, Semestral: 2, Anual: 1 };
+
+v1.get('/contacts/:id', async (req, res, next) => {
+  try {
+    const data = await withAuthedTx(req.authCtx!, async (tx) => {
+      const [c] = await tx.select().from(contacts).where(eq(contacts.id, req.params.id)).limit(1);
+      if (!c) return null;
+
+      const cockpit = await assembleCockpit(tx, new Date());
+      const polizas = (cockpit.POLICIES as Array<{ id: string; contactId: string | null; prima: number; freq: string }>).filter(
+        (p) => p.contactId === c.id,
+      );
+      const polIds = new Set(polizas.map((p) => p.id));
+      const siniestros = (cockpit.SINIESTROS as Array<{ policyId: string | null }>).filter(
+        (s) => s.policyId != null && polIds.has(s.policyId),
+      );
+      const crosssell = (cockpit.CROSSSELL as Array<{ contactId?: string }>).filter((x) => x.contactId === c.id);
+
+      const name = displayName(c);
+      const addressLine = [
+        [c.addressStreet, c.addressNumber].filter(Boolean).join(' '),
+        [c.addressFloor, c.addressApartment].filter(Boolean).join(' '),
+        c.addressCity,
+        c.addressProvince,
+        c.addressPostalCode,
+      ]
+        .filter(Boolean)
+        .join(', ');
+      const methods = Array.isArray(c.contactMethods)
+        ? (c.contactMethods as Array<{ type?: string; value?: string; primary?: boolean }>).map((m) => ({
+            type: METHOD_TYPE_LABEL[m.type ?? ''] ?? (m.type ?? '—'),
+            value: m.value ?? '',
+            primary: Boolean(m.primary),
+          }))
+        : [];
+      const primaAnual = polizas.reduce((a, p) => a + (Number(p.prima) || 0) * (FREQ_MULT[p.freq] ?? 1), 0);
+
+      return {
+        id: c.id,
+        name,
+        initials: initialsOf(name),
+        kind: c.kind === 'PERSONA_JURIDICA' ? 'Empresa' : 'Persona',
+        status: CONTACT_STATUS_LABEL[c.status] ?? c.status,
+        document: c.dni ? `DNI ${c.dni}` : c.cuit ? `CUIT ${c.cuit}` : '—',
+        address: addressLine || null,
+        city: c.addressCity ?? '—',
+        notes: c.notes ?? null,
+        since: String(c.createdAt.getFullYear()),
+        phone: firstPhone(c.contactMethods),
+        contactMethods: methods,
+        tags:
+          c.status === 'prospecto' ? ['Prospecto'] : c.status === 'exasegurado' ? ['Ex cliente'] : ['Cliente'],
+        polizas,
+        siniestros,
+        crosssell,
+        stats: { primaAnual, polizas: polizas.length, siniestros: siniestros.length },
+      };
+    });
+    if (!data) {
+      res.status(404).json({ error: 'Asegurado no encontrado' });
+      return;
+    }
+    res.json(data);
   } catch (err) {
     next(err);
   }

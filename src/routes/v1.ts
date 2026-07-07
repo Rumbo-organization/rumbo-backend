@@ -222,6 +222,8 @@ async function assembleCockpit(tx: AuthedTx, now: Date) {
       city: c.addressCity ?? '—',
       initials: initialsOf(name),
       phone: firstPhone(c.contactMethods),
+      // Documento para la búsqueda de la tabla (nombre o DNI/CUIT).
+      document: c.dni ? `DNI ${c.dni}` : c.cuit ? `CUIT ${c.cuit}` : null,
       since: String(c.createdAt.getFullYear()),
       tags:
         c.status === 'prospecto'

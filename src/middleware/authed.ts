@@ -1,0 +1,89 @@
+import type { NextFunction, Request, Response } from 'express';
+import { fromNodeHeaders } from 'better-auth/node';
+import { and, eq } from 'drizzle-orm';
+
+import { auth } from '../auth.js';
+import { db, schema, type AuthContext } from '../db/client.js';
+
+declare global {
+  // eslint-disable-next-line @typescript-eslint/no-namespace
+  namespace Express {
+    interface Request {
+      authCtx?: AuthContext;
+    }
+  }
+}
+
+// Middleware de aislamiento multi-tenant (CLAUDE.md §6): resuelve la sesión de
+// Better Auth y deja {userId, orgId} en req.authCtx. Toda ruta /api/v1 pasa por
+// acá; las queries después corren dentro de withAuthedTx (RLS) con ese contexto.
+export async function requireAuthedOrg(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const s = await auth.api.getSession({
+      headers: fromNodeHeaders(req.headers),
+    });
+    if (!s) {
+      res.status(401).json({ error: 'No autenticado' });
+      return;
+    }
+
+    // Org activa de la sesión; fallback a la primera membership para sesiones
+    // creadas antes del hook (o si el plugin la limpió).
+    const activeOrg =
+      (s.session as { activeOrganizationId?: string | null })
+        .activeOrganizationId ?? null;
+
+    // Membership del usuario en la org activa (o la primera si no hay activa).
+    // Aporta el `role` que gobierna is_org_admin() en las policies RLS.
+    const memberQuery = db
+      .select({
+        orgId: schema.members.organizationId,
+        role: schema.members.role,
+      })
+      .from(schema.members)
+      .where(
+        activeOrg
+          ? and(
+              eq(schema.members.userId, s.user.id),
+              eq(schema.members.organizationId, activeOrg),
+            )
+          : eq(schema.members.userId, s.user.id),
+      )
+      .limit(1);
+    const [member] = await memberQuery;
+
+    const orgId = member?.orgId ?? activeOrg;
+    if (!orgId) {
+      res.status(403).json({ error: 'Sin organización activa' });
+      return;
+    }
+
+    // producers.id del usuario en esta org (producer_scope RLS). Puede no
+    // existir: un miembro sin ficha de productor solo verá lo que su rol
+    // `owner` le permita (toda la org) o nada.
+    const [producer] = await db
+      .select({ id: schema.producers.id })
+      .from(schema.producers)
+      .where(
+        and(
+          eq(schema.producers.userId, s.user.id),
+          eq(schema.producers.orgId, orgId),
+        ),
+      )
+      .limit(1);
+
+    req.authCtx = {
+      userId: s.user.id,
+      orgId,
+      role: member?.role ?? 'member',
+      producerId: producer?.id ?? null,
+    };
+    next();
+  } catch (err) {
+    next(err);
+  }
+}

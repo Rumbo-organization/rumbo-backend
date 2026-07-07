@@ -5,6 +5,10 @@ import { requireAuthedOrg } from '../middleware/authed.js';
 import { withAuthedTx, schema, type AuthedTx } from '../db/client.js';
 import { calendar } from './calendar.js';
 import { claimsRouter } from './claims.js';
+import { writeAuditLogTx } from '../audit.js';
+
+const isUuidV1 = (s: unknown): s is string =>
+  typeof s === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s);
 
 const {
   auditLog,
@@ -60,6 +64,19 @@ const CLAIM_STATUS_LABEL: Record<string, string> = {
   en_curso: 'En curso',
   cerrado: 'Cerrado',
 };
+
+const CLAIM_IMPORTANCE_LABEL: Record<string, string> = {
+  alta: 'Alta',
+  media: 'Media',
+  baja: 'Baja',
+};
+
+const PAYMENT_METHOD_LABEL: Record<string, string> = {
+  cupon: 'Cupón',
+  debito_bancario: 'Débito bancario',
+  tarjeta_credito: 'Tarjeta de crédito',
+};
+const paymentLabel = (m: string | null): string | null => (m ? PAYMENT_METHOD_LABEL[m] ?? m : null);
 
 const POLICY_STATUS_LABEL: Record<string, string> = {
   propuesta: 'Propuesta',
@@ -247,6 +264,7 @@ async function assembleCockpit(tx: AuthedTx, now: Date) {
     start: p.startDate,
     renew: p.endDate,
     coverage: p.notes ?? '—',
+    paymentMethod: paymentLabel(p.paymentMethod),
     sumaAseg: p.sumaAsegurada == null ? null : num(p.sumaAsegurada),
   }));
   const policyById = new Map(policyRows.map(({ p }) => [p.id, p]));
@@ -276,6 +294,8 @@ async function assembleCockpit(tx: AuthedTx, now: Date) {
       policyId: c.policyId,
       num: c.claimNumber ?? '—',
       status: CLAIM_STATUS_LABEL[c.status] ?? c.status,
+      importance: c.importance ? CLAIM_IMPORTANCE_LABEL[c.importance] ?? c.importance : null,
+      reportedBy: c.reportedBy,
       stale: Math.max(0, stale),
       opened: c.occurredAt.toISOString().slice(0, 10),
       insurer: (p?.insurerId && insurerName.get(p.insurerId)) || '—',
@@ -651,6 +671,81 @@ v1.get('/contacts/:id', async (req, res, next) => {
   } catch (err) {
     next(err);
   }
+});
+
+// Alta de contacto (regla de negocio del founder): nace SIEMPRE como prospecto
+// — no hay selector de estado. Pasa a cliente cuando se importa su primera
+// póliza. RLS + audit; producerId estampado server-side (producer_scope).
+v1.post('/contacts', async (req, res, next) => {
+  const b = (req.body ?? {}) as Record<string, unknown>;
+  const kind = b.kind === 'PERSONA_JURIDICA' ? 'PERSONA_JURIDICA' : 'PERSONA_FISICA';
+  const str = (v: unknown): string | null => (typeof v === 'string' && v.trim() !== '' ? v.trim() : null);
+  const digits = (v: unknown): string | null => (typeof v === 'string' ? v.replace(/\D/g, '') : '') || null;
+  const firstName = str(b.firstName);
+  const lastName = str(b.lastName);
+  const legalName = str(b.legalName);
+  if (kind === 'PERSONA_JURIDICA') {
+    if (!legalName) { res.status(400).json({ error: 'La razón social es obligatoria.' }); return; }
+  } else if (!firstName && !lastName) {
+    res.status(400).json({ error: 'Nombre o apellido es obligatorio.' }); return;
+  }
+  const phone = str(b.phone);
+  const contactMethods = phone ? [{ type: 'celular' as const, value: phone, primary: true }] : [];
+  const ctx = req.authCtx!;
+  try {
+    const out = await withAuthedTx(ctx, async (tx) => {
+      const [row] = await tx
+        .insert(contacts)
+        .values({
+          orgId: ctx.orgId,
+          kind,
+          firstName,
+          lastName,
+          legalName,
+          dni: kind === 'PERSONA_FISICA' ? digits(b.dni) : null,
+          cuit: digits(b.cuit),
+          status: 'prospecto', // forzado
+          addressCity: str(b.city),
+          notes: str(b.notes),
+          contactMethods,
+          producerId: ctx.producerId,
+        })
+        .returning({ id: contacts.id });
+      if (!row) throw new Error('alta contacto: el insert no devolvió fila');
+      await writeAuditLogTx(tx, {
+        orgId: ctx.orgId, userId: ctx.userId, action: 'create_contact', entityType: 'contact', entityId: row.id, payload: { kind },
+      });
+      return row;
+    });
+    res.status(201).json({ id: out.id });
+  } catch (err) { next(err); }
+});
+
+// Edición de póliza: SOLO observaciones (regla del founder — las pólizas se
+// importan de las aseguradoras; el resto es read-only). RLS oculta lo ajeno → 404.
+v1.patch('/policies/:id', async (req, res, next) => {
+  const id = req.params.id;
+  if (!isUuidV1(id)) { res.status(400).json({ error: 'Id inválido.' }); return; }
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const notes = typeof body.notes === 'string' ? body.notes.trim() : '';
+  if (notes.length > 4000) { res.status(400).json({ error: 'Observaciones demasiado largas.' }); return; }
+  const ctx = req.authCtx!;
+  try {
+    const out = await withAuthedTx(ctx, async (tx) => {
+      const [row] = await tx
+        .update(policies)
+        .set({ notes: notes || null, updatedAt: new Date() })
+        .where(eq(policies.id, id))
+        .returning({ id: policies.id, notes: policies.notes });
+      if (!row) return null;
+      await writeAuditLogTx(tx, {
+        orgId: ctx.orgId, userId: ctx.userId, action: 'update_policy_notes', entityType: 'policy', entityId: id,
+      });
+      return row;
+    });
+    if (!out) { res.status(404).json({ error: 'Póliza no encontrada.' }); return; }
+    res.json({ id: out.id, notes: out.notes });
+  } catch (err) { next(err); }
 });
 
 // Organización activa y usuario de la sesión (para el chrome del cockpit).

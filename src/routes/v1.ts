@@ -227,8 +227,8 @@ async function assembleCockpit(tx: AuthedTx, now: Date) {
         c.status === 'prospecto'
           ? ['Prospecto']
           : c.status === 'exasegurado'
-            ? ['Ex cliente']
-            : ['Cliente'],
+            ? ['Ex asegurado']
+            : ['Asegurado'],
     };
   });
 
@@ -464,7 +464,7 @@ async function assembleCockpit(tx: AuthedTx, now: Date) {
   const BOOK = {
     primaTotal: vigentes.reduce((a, { p }) => a + num(p.prima), 0),
     vigentes: vigentes.length,
-    contactos: CONTACTS.filter((c) => c.tags.includes('Cliente')).length,
+    contactos: CONTACTS.filter((c) => c.tags.includes('Asegurado')).length,
     vence30,
     siniestros: openClaims.length,
     cuotasVencidas: CUOTAS.length,
@@ -596,8 +596,8 @@ v1.get('/policies/:id', async (req, res, next) => {
 // datos propios; el id de la URL nunca alcanza para ver ajeno.
 const CONTACT_STATUS_LABEL: Record<string, string> = {
   prospecto: 'Prospecto',
-  asegurado: 'Cliente',
-  exasegurado: 'Ex cliente',
+  asegurado: 'Asegurado',
+  exasegurado: 'Ex asegurado',
 };
 const METHOD_TYPE_LABEL: Record<string, string> = {
   telefono: 'Teléfono',
@@ -656,11 +656,31 @@ v1.get('/contacts/:id', async (req, res, next) => {
         phone: firstPhone(c.contactMethods),
         contactMethods: methods,
         tags:
-          c.status === 'prospecto' ? ['Prospecto'] : c.status === 'exasegurado' ? ['Ex cliente'] : ['Cliente'],
+          c.status === 'prospecto' ? ['Prospecto'] : c.status === 'exasegurado' ? ['Ex asegurado'] : ['Asegurado'],
         polizas,
         siniestros,
         crosssell,
         stats: { primaAnual, polizas: polizas.length, siniestros: siniestros.length },
+        // Valores crudos para el formulario de edición (la vista de arriba usa
+        // shapes de display: status con label, address concatenada, tipos de
+        // método traducidos). El form necesita los valores editables sin formato.
+        form: {
+          kind: c.kind,
+          firstName: c.firstName,
+          lastName: c.lastName,
+          legalName: c.legalName,
+          dni: c.dni,
+          cuit: c.cuit,
+          notes: c.notes,
+          addressStreet: c.addressStreet,
+          addressNumber: c.addressNumber,
+          addressFloor: c.addressFloor,
+          addressApartment: c.addressApartment,
+          addressCity: c.addressCity,
+          addressProvince: c.addressProvince,
+          addressPostalCode: c.addressPostalCode,
+          contactMethods: Array.isArray(c.contactMethods) ? c.contactMethods : [],
+        },
       };
     });
     if (!data) {
@@ -718,6 +738,76 @@ v1.post('/contacts', async (req, res, next) => {
       return row;
     });
     res.status(201).json({ id: out.id });
+  } catch (err) { next(err); }
+});
+
+// Edición del asegurado/contacto (F-010 medios múltiples · F-020 domicilio):
+// datos, domicilio y medios de contacto. Update parcial — solo toca las claves
+// presentes en el body. El `status` NO se edita acá (lo gobierna la regla de
+// pólizas). RLS oculta lo ajeno → el update no matchea fila → 404.
+const METHOD_TYPES = new Set(['telefono', 'celular', 'email', 'whatsapp']);
+type MethodType = 'telefono' | 'celular' | 'email' | 'whatsapp';
+
+v1.patch('/contacts/:id', async (req, res, next) => {
+  const id = req.params.id;
+  if (!isUuidV1(id)) { res.status(400).json({ error: 'Id inválido.' }); return; }
+  const b = (req.body ?? {}) as Record<string, unknown>;
+  const str = (v: unknown): string | null => (typeof v === 'string' && v.trim() !== '' ? v.trim() : null);
+  const digits = (v: unknown): string | null => (typeof v === 'string' ? v.replace(/\D/g, '') : '') || null;
+
+  const set: Partial<typeof contacts.$inferInsert> = { updatedAt: new Date() };
+  if ('firstName' in b) set.firstName = str(b.firstName);
+  if ('lastName' in b) set.lastName = str(b.lastName);
+  if ('legalName' in b) set.legalName = str(b.legalName);
+  if ('dni' in b) set.dni = digits(b.dni);
+  if ('cuit' in b) set.cuit = digits(b.cuit);
+  if ('notes' in b) set.notes = str(b.notes);
+  if ('addressStreet' in b) set.addressStreet = str(b.addressStreet);
+  if ('addressNumber' in b) set.addressNumber = str(b.addressNumber);
+  if ('addressFloor' in b) set.addressFloor = str(b.addressFloor);
+  if ('addressApartment' in b) set.addressApartment = str(b.addressApartment);
+  if ('addressCity' in b) set.addressCity = str(b.addressCity);
+  if ('addressProvince' in b) set.addressProvince = str(b.addressProvince);
+  if ('addressPostalCode' in b) set.addressPostalCode = str(b.addressPostalCode);
+
+  if ('contactMethods' in b) {
+    if (!Array.isArray(b.contactMethods)) { res.status(400).json({ error: 'contactMethods debe ser una lista.' }); return; }
+    if (b.contactMethods.length > 20) { res.status(400).json({ error: 'Demasiados medios de contacto (máx. 20).' }); return; }
+    const cleaned: Array<{ type: MethodType; value: string; primary: boolean }> = [];
+    for (const raw of b.contactMethods as unknown[]) {
+      const m = (raw ?? {}) as Record<string, unknown>;
+      const type = typeof m.type === 'string' ? m.type : '';
+      const value = typeof m.value === 'string' ? m.value.trim() : '';
+      if (!METHOD_TYPES.has(type)) { res.status(400).json({ error: `Tipo de contacto inválido: ${type || '—'}.` }); return; }
+      if (!value) continue; // descarta filas vacías
+      cleaned.push({ type: type as MethodType, value, primary: Boolean(m.primary) });
+    }
+    // Exactamente un principal: el primero marcado; si ninguno, el primero de la lista.
+    let seenPrimary = false;
+    for (const m of cleaned) {
+      if (m.primary && !seenPrimary) seenPrimary = true;
+      else m.primary = false;
+    }
+    if (!seenPrimary && cleaned.length > 0) cleaned[0]!.primary = true;
+    set.contactMethods = cleaned;
+  }
+
+  const ctx = req.authCtx!;
+  try {
+    const out = await withAuthedTx(ctx, async (tx) => {
+      const [row] = await tx
+        .update(contacts)
+        .set(set)
+        .where(eq(contacts.id, id))
+        .returning({ id: contacts.id });
+      if (!row) return null;
+      await writeAuditLogTx(tx, {
+        orgId: ctx.orgId, userId: ctx.userId, action: 'update_contact', entityType: 'contact', entityId: id,
+      });
+      return row;
+    });
+    if (!out) { res.status(404).json({ error: 'Asegurado no encontrado.' }); return; }
+    res.json({ id: out.id });
   } catch (err) { next(err); }
 });
 

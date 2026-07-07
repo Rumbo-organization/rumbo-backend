@@ -453,25 +453,57 @@ async function assembleCockpit(tx: AuthedTx, now: Date) {
     };
   });
 
-  // ---- agregados del BOOK ----
-  const vigentes = policyRows.filter(({ p }) => p.status === 'vigente');
-  const vence30 = VENCIMIENTOS.filter((v) => v.days <= 30).length;
-  const openClaims = claimRows.filter(({ c }) => c.status !== 'cerrado');
-  const staleClaims = openClaims.filter(({ stale }) => stale >= 10).length;
-  const cuotasMonto = CUOTAS.reduce((a, c) => a + c.amount, 0);
+  // ---- agregados del BOOK: SQL directo (uncapped), NO las arrays capadas ----
+  // (Fase 3 escalabilidad: el dashboard debe contar toda la cartera, no las
+  // primeras 1000/500 filas del bootstrap.) Bajo RLS = solo esta org.
+  const [polAgg] = (await tx.execute(sql`
+    select
+      count(*)::int as total,
+      count(*) filter (where status = 'vigente')::int as vigentes,
+      coalesce(sum(prima) filter (where status = 'vigente'), 0)::float8 as prima_vigente,
+      count(*) filter (where status = 'vigente' and end_date is not null and (end_date - current_date) <= 30)::int as vence30,
+      count(*) filter (where status = 'vigente' and end_date is not null and (end_date - current_date) <= 7)::int as vence7
+    from policies
+  `)).rows as unknown as Array<{ total: number; vigentes: number; prima_vigente: number; vence30: number; vence7: number }>;
+
+  const [primaAnualRow] = (await tx.execute(sql`
+    select coalesce(sum(p.prima * (case when ic.n >= 10 then 12 when ic.n >= 4 then 4 when ic.n >= 2 then 2 else 1 end)), 0)::float8 as prima_anual
+    from policies p
+    left join (select policy_id, count(*)::int as n from policy_installments group by policy_id) ic on ic.policy_id = p.id
+  `)).rows as unknown as Array<{ prima_anual: number }>;
+
+  const [contactAgg] = (await tx.execute(sql`
+    select count(*) filter (where status = 'asegurado')::int as asegurados from contacts
+  `)).rows as unknown as Array<{ asegurados: number }>;
+
+  const [claimAgg] = (await tx.execute(sql`
+    select
+      count(*) filter (where status <> 'cerrado')::int as abiertos,
+      count(*) filter (where status <> 'cerrado' and last_activity_at <= now() - interval '10 days')::int as stale
+    from claims
+  `)).rows as unknown as Array<{ abiertos: number; stale: number }>;
+
+  const [cuotaAgg] = (await tx.execute(sql`
+    select count(*)::int as vencidas, coalesce(sum(amount), 0)::float8 as monto
+    from policy_installments
+    where paid_at is null and due_date < current_date
+  `)).rows as unknown as Array<{ vencidas: number; monto: number }>;
+
   const health = Math.max(
     40,
-    Math.min(99, 100 - staleClaims * 8 - CUOTAS.length * 5 - VENCIMIENTOS.filter((v) => v.days <= 7).length * 3),
+    Math.min(99, 100 - (claimAgg?.stale ?? 0) * 8 - (cuotaAgg?.vencidas ?? 0) * 5 - (polAgg?.vence7 ?? 0) * 3),
   );
 
   const BOOK = {
-    primaTotal: vigentes.reduce((a, { p }) => a + num(p.prima), 0),
-    vigentes: vigentes.length,
-    contactos: CONTACTS.filter((c) => c.tags.includes('Asegurado')).length,
-    vence30,
-    siniestros: openClaims.length,
-    cuotasVencidas: CUOTAS.length,
-    cuotasMonto,
+    primaTotal: polAgg?.prima_vigente ?? 0,
+    primaAnual: primaAnualRow?.prima_anual ?? 0,
+    polizas: polAgg?.total ?? 0,
+    vigentes: polAgg?.vigentes ?? 0,
+    contactos: contactAgg?.asegurados ?? 0,
+    vence30: polAgg?.vence30 ?? 0,
+    siniestros: claimAgg?.abiertos ?? 0,
+    cuotasVencidas: cuotaAgg?.vencidas ?? 0,
+    cuotasMonto: cuotaAgg?.monto ?? 0,
     health,
   };
 

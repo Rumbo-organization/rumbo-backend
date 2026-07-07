@@ -362,8 +362,11 @@ export const contacts = pgTable(
     index("contacts_org_status_idx").on(table.orgId, table.status),
     index("contacts_dni_idx").on(table.dni),
     index("contacts_cuit_idx").on(table.cuit),
-    // Índice de búsqueda trigram (F-012) sobre nombre se crea en la migración
-    // hand-written de RLS+search (requiere extensión pg_trgm + expresión).
+    // Búsqueda trigram (F-012) por nombre — pg_trgm/GIN. Requiere la extensión;
+    // ver migrations/0002_search_trgm_indexes.sql.
+    index("contacts_first_name_trgm").using("gin", sql`${table.firstName} gin_trgm_ops`),
+    index("contacts_last_name_trgm").using("gin", sql`${table.lastName} gin_trgm_ops`),
+    index("contacts_legal_name_trgm").using("gin", sql`${table.legalName} gin_trgm_ops`),
   ],
 );
 
@@ -399,6 +402,8 @@ export const insurers = pgTable(
   (table) => [
     index("insurers_org_idx").on(table.orgId),
     uniqueIndex("insurers_org_name_idx").on(table.orgId, table.name),
+    // Búsqueda trigram por nombre de aseguradora (ver 0002_search_trgm_indexes.sql).
+    index("insurers_name_trgm").using("gin", sql`${table.name} gin_trgm_ops`),
   ],
 );
 
@@ -625,6 +630,10 @@ export const policies = pgTable(
     index("policies_insurer_idx").on(table.insurerId),
     // Vencimientos (F-025): query por ventana de fecha de fin dentro de la org.
     index("policies_org_enddate_idx").on(table.orgId, table.endDate),
+    // Búsqueda por substring (ILIKE '%q%') del listado paginado — pg_trgm/GIN.
+    // Ver migrations/0002_search_trgm_indexes.sql y roadmap/PLAN-ESCALABILIDAD.md.
+    index("policies_policy_number_trgm").using("gin", sql`${table.policyNumber} gin_trgm_ops`),
+    index("policies_notes_trgm").using("gin", sql`${table.notes} gin_trgm_ops`),
     // Idempotencia de sync: una póliza externa por (org, aseguradora, ref).
     uniqueIndex("policies_external_ref_idx")
       .on(table.orgId, table.insurerId, table.externalRef)
@@ -677,6 +686,9 @@ export const policyRisks = pgTable(
     index("policy_risks_policy_idx").on(table.policyId),
     // Búsqueda por patente dentro de la org (F-012).
     index("policy_risks_org_patente_idx").on(table.orgId, table.patente),
+    // Filtro "flota" por descripción del riesgo — pg_trgm/GIN
+    // (ver 0002_search_trgm_indexes.sql).
+    index("policy_risks_descripcion_trgm").using("gin", sql`${table.descripcion} gin_trgm_ops`),
   ],
 );
 

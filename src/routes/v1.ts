@@ -776,11 +776,20 @@ v1.get('/policies', async (req, res, next) => {
 });
 
 // Póliza individual (misma forma que un item de POLICIES; 404 si no es de la org).
+// Consulta directa (sin assembleCockpit → no capa por LIMIT ni rearma el cockpit).
 v1.get('/policies/:id', async (req, res, next) => {
+  const id = req.params.id;
+  if (!isUuidV1(id)) { res.status(400).json({ error: 'Id inválido.' }); return; }
   try {
     const p = await withAuthedTx(req.authCtx!, async (tx) => {
-      const cockpit = await assembleCockpit(tx, new Date());
-      return (cockpit.POLICIES as Array<{ id: string }>).find((x) => x.id === req.params.id) ?? null;
+      const [row] = await tx
+        .select(policyRowSelect)
+        .from(policies)
+        .leftJoin(insurers, eq(insurers.id, policies.insurerId))
+        .leftJoin(contacts, eq(contacts.id, policies.contactId))
+        .where(eq(policies.id, id))
+        .limit(1);
+      return row ? mapPolicyRow(row) : null;
     });
     if (!p) {
       res.status(404).json({ error: 'Póliza no encontrada' });

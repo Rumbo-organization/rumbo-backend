@@ -5,6 +5,9 @@ import { requireAuthedOrg, requireOwner } from '../middleware/authed.js';
 import { withAuthedTx, schema, type AuthedTx } from '../db/client.js';
 import { calendar } from './calendar.js';
 import { claimsRouter } from './claims.js';
+import { policyExtras } from './policy-extras.js';
+import { contactExtras } from './contact-extras.js';
+import { documentsRouter } from './documents.js';
 import { writeAuditLogTx } from '../audit.js';
 
 const isUuidV1 = (s: unknown): s is string =>
@@ -75,6 +78,29 @@ const PAYMENT_METHOD_LABEL: Record<string, string> = {
   cupon: 'Cupón',
   debito_bancario: 'Débito bancario',
   tarjeta_credito: 'Tarjeta de crédito',
+};
+
+const ENDORSEMENT_TYPE_LABEL: Record<string, string> = {
+  emision: 'Emisión', refacturacion: 'Refacturación', endoso: 'Endoso', anulacion: 'Anulación',
+};
+const PARTY_ROLE_LABEL: Record<string, string> = {
+  asegurado: 'Asegurado', tomador: 'Tomador', beneficiario: 'Beneficiario',
+  conductor: 'Conductor', acreedor_prendario: 'Acreedor prendario', otro: 'Otro',
+};
+const RELATION_TYPE_LABEL: Record<string, string> = {
+  conyuge: 'Cónyuge', conviviente: 'Conviviente', hijo: 'Hijo/a', padre_madre: 'Padre/Madre',
+  hermano: 'Hermano/a', socio: 'Socio/a', empleado: 'Empleado/a', empleador: 'Empleador/a',
+  familiar: 'Familiar', otro: 'Otro',
+};
+// El inverso de cada relación (se guarda UNA fila dirigida; al leer desde el
+// otro lado se deriva). Igual al CONTACT_RELATION_INVERSE del viejo.
+const RELATION_INVERSE: Record<string, string> = {
+  conyuge: 'conyuge', conviviente: 'conviviente', hijo: 'padre_madre', padre_madre: 'hijo',
+  hermano: 'hermano', socio: 'socio', empleado: 'empleador', empleador: 'empleado',
+  familiar: 'familiar', otro: 'otro',
+};
+const ASSIGNEE_ROLE_LABEL: Record<string, string> = {
+  responsable: 'Responsable', comercial: 'Comercial', cobranzas: 'Cobranzas', siniestros: 'Siniestros',
 };
 const paymentLabel = (m: string | null): string | null => (m ? PAYMENT_METHOD_LABEL[m] ?? m : null);
 
@@ -484,6 +510,13 @@ v1.get('/claims/picker', async (req, res, next) => {
 // lista sigue en v1.get('/claims') (alias del cockpit) más abajo; este router no
 // define GET '/', así que esa ruta cae al handler de lectura.
 v1.use('/claims', claimsRouter);
+
+// Slice 4 de paridad: plan de pagos (CRUD) / endosos / personas de la póliza,
+// relaciones / direcciones / responsables del asegurado, y documentos (R2).
+// Paths absolutos adentro de cada router; heredan requireAuthedOrg.
+v1.use(policyExtras);
+v1.use(contactExtras);
+v1.use(documentsRouter);
 
 // Corre fn dentro de withAuthedTx y responde JSON; centraliza el try/catch.
 function handle<T>(fn: (tx: AuthedTx, ctx: NonNullable<import('../db/client.js').AuthContext>) => Promise<T>) {
@@ -1264,13 +1297,58 @@ v1.get('/policies/:id/detail', async (req, res, next) => {
         .where(eq(policyInstallments.policyId, id))
         .orderBy(asc(policyInstallments.number));
       const installments = instRows.map(({ i, daysFromDue }) => ({
+        id: i.id,
         cuota: i.number,
         date: i.dueDate,
         amount: i.amount == null ? 0 : Number(i.amount),
+        paid: i.paidAt != null,
         status: i.paidAt != null ? 'Pagada' : daysFromDue > 0 ? 'Vencida' : daysFromDue >= -8 ? 'Por vencer' : 'Programada',
       }));
 
-      return { policy, contact, siniestros, crosssell, activity, installments };
+      // Slice 4: bien asegurado, endosos, personas y documentos de la póliza.
+      const riskRows = await tx
+        .select()
+        .from(policyRisks)
+        .where(eq(policyRisks.policyId, id))
+        .orderBy(asc(policyRisks.createdAt));
+      const risks = riskRows.map((r) => ({
+        id: r.id, descripcion: r.descripcion, patente: r.patente ?? null,
+      }));
+
+      const endosoRows = await tx
+        .select()
+        .from(schema.policyEndorsements)
+        .where(eq(schema.policyEndorsements.policyId, id))
+        .orderBy(asc(schema.policyEndorsements.number));
+      const endosos = endosoRows.map((e) => ({
+        id: e.id, number: e.number, type: ENDORSEMENT_TYPE_LABEL[e.type] ?? e.type, typeRaw: e.type,
+        issuedAt: e.issuedAt, startDate: e.startDate, endDate: e.endDate,
+        prima: e.prima == null ? null : Number(e.prima), premio: e.premio == null ? null : Number(e.premio),
+        description: e.description,
+      }));
+
+      const partyRows = await tx
+        .select({ pp: schema.policyParties, kind: contacts.kind, firstName: contacts.firstName, lastName: contacts.lastName, legalName: contacts.legalName, dni: contacts.dni, cuit: contacts.cuit })
+        .from(schema.policyParties)
+        .innerJoin(contacts, eq(contacts.id, schema.policyParties.contactId))
+        .where(eq(schema.policyParties.policyId, id))
+        .orderBy(asc(schema.policyParties.createdAt));
+      const personas = partyRows.map(({ pp, kind, firstName, lastName, legalName, dni, cuit }) => ({
+        id: pp.id, contactId: pp.contactId, role: PARTY_ROLE_LABEL[pp.role] ?? pp.role, roleRaw: pp.role,
+        name: displayName({ kind, firstName, lastName, legalName }),
+        document: dni ? `DNI ${dni}` : cuit ? `CUIT ${cuit}` : '—',
+      }));
+
+      const docRows = await tx
+        .select()
+        .from(schema.documents)
+        .where(eq(schema.documents.policyId, id))
+        .orderBy(asc(schema.documents.createdAt));
+      const documentos = docRows.map((d) => ({
+        id: d.id, fileName: d.fileName, contentType: d.contentType, sizeBytes: d.sizeBytes,
+      }));
+
+      return { policy, contact, siniestros, crosssell, activity, installments, risks, endosos, personas, documentos };
     });
     if (!out) { res.status(404).json({ error: 'Póliza no encontrada' }); return; }
     res.json(out);
@@ -1379,6 +1457,66 @@ v1.get('/contacts/:id', async (req, res, next) => {
         : [];
       const primaAnual = polizas.reduce((a, p) => a + (Number(p.prima) || 0) * (FREQ_MULT[p.freq] ?? 1), 0);
 
+      // Slice 4: relaciones (bidireccionales, resueltas desde la perspectiva
+      // del consultado), direcciones adicionales, responsables y documentos.
+      const relRows = await tx
+        .select()
+        .from(schema.contactRelationships)
+        .where(sql`${schema.contactRelationships.contactId} = ${c.id} or ${schema.contactRelationships.relatedContactId} = ${c.id}`)
+        .orderBy(asc(schema.contactRelationships.createdAt));
+      const otherIds = [...new Set(relRows.map((r) => (r.contactId === c.id ? r.relatedContactId : r.contactId)))];
+      const otherRows = otherIds.length
+        ? await tx.select().from(contacts).where(inArray(contacts.id, otherIds))
+        : [];
+      const otherById = new Map(otherRows.map((o) => [o.id, o]));
+      const relaciones = relRows.map((r) => {
+        const forward = r.contactId === c.id;
+        const otherId = forward ? r.relatedContactId : r.contactId;
+        const other = otherById.get(otherId);
+        const typeRaw = forward ? r.type : (RELATION_INVERSE[r.type] ?? r.type);
+        return {
+          id: r.id,
+          type: RELATION_TYPE_LABEL[typeRaw] ?? typeRaw,
+          note: r.note,
+          otherContactId: otherId,
+          otherName: other ? displayName(other) : '—',
+        };
+      });
+
+      const dirRows = await tx
+        .select()
+        .from(schema.contactAddresses)
+        .where(eq(schema.contactAddresses.contactId, c.id))
+        .orderBy(asc(schema.contactAddresses.createdAt));
+      const direcciones = dirRows.map((d) => ({
+        id: d.id,
+        label: d.label ?? 'Dirección',
+        line: [
+          [d.street, d.number].filter(Boolean).join(' '),
+          [d.floor, d.apartment].filter(Boolean).join(' '),
+          d.city, d.province, d.postalCode,
+        ].filter(Boolean).join(', '),
+      }));
+
+      const asgRows = await tx
+        .select({ a: schema.contactAssignees, userName: users.name, userEmail: users.email })
+        .from(schema.contactAssignees)
+        .innerJoin(users, eq(users.id, schema.contactAssignees.userId))
+        .where(eq(schema.contactAssignees.contactId, c.id))
+        .orderBy(asc(schema.contactAssignees.createdAt));
+      const responsables = asgRows.map(({ a, userName, userEmail }) => ({
+        id: a.id, userId: a.userId, role: ASSIGNEE_ROLE_LABEL[a.role] ?? a.role, name: userName, email: userEmail,
+      }));
+
+      const docRows = await tx
+        .select()
+        .from(schema.documents)
+        .where(eq(schema.documents.contactId, c.id))
+        .orderBy(asc(schema.documents.createdAt));
+      const documentos = docRows.map((d) => ({
+        id: d.id, fileName: d.fileName, contentType: d.contentType, sizeBytes: d.sizeBytes,
+      }));
+
       // Log de comunicaciones del asegurado (paridad communications.byContact).
       const now = new Date();
       const commRows = await tx
@@ -1416,6 +1554,10 @@ v1.get('/contacts/:id', async (req, res, next) => {
         siniestros,
         crosssell,
         comunicaciones,
+        relaciones,
+        direcciones,
+        responsables,
+        documentos,
         stats: { primaAnual, polizas: polizas.length, siniestros: siniestros.length },
         // Valores crudos para el formulario de edición (la vista de arriba usa
         // shapes de display: status con label, address concatenada, tipos de

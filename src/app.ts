@@ -50,6 +50,24 @@ app.get('/api/health', async (_req, res) => {
   });
 });
 
+// Cron diario de avisos de vencimiento (Slice 5 de paridad). Job de SISTEMA:
+// sin sesión, protegido por CRON_SECRET (Vercel Cron manda Authorization:
+// Bearer <CRON_SECRET>). Corre con el cliente owner (bypass RLS) y scopea por
+// org/productor en el código (PARIDAD §5, "batch/sistema").
+app.get('/api/cron/expiry-notifications', async (req, res) => {
+  const secret = process.env.CRON_SECRET;
+  if (!secret) { res.status(503).json({ error: 'CRON_SECRET sin configurar.' }); return; }
+  if (req.headers.authorization !== `Bearer ${secret}`) { res.status(401).json({ error: 'No autorizado.' }); return; }
+  try {
+    const { runExpiryNotifications } = await import('./expiry-job.js');
+    const result = await runExpiryNotifications();
+    res.json(result);
+  } catch (err) {
+    console.error('[cron:expiry]', err);
+    res.status(500).json({ error: 'La corrida falló; se reintenta mañana.' });
+  }
+});
+
 // REST v1 (D-026): /bootstrap (BFF del cockpit) + lecturas + escrituras.
 // writeRateLimit acota POST/PATCH/DELETE por IP (A04/A07). Detrás:
 // requireAuthedOrg (sesión + org) y withAuthedTx (RLS + audit).

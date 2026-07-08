@@ -1332,6 +1332,40 @@ export const messageTemplates = pgTable(
   (table) => [index("message_templates_org_idx").on(table.orgId)],
 );
 
+// Dedup de avisos de vencimiento por email (Slice 5 de paridad). Unique
+// (policy, window): una póliza se avisa UNA vez por ventana (30d/7d). RLS
+// habilitado SIN policies (fail-closed): solo la toca el cron con el cliente
+// owner. La tabla YA existe en la DB (migración 0050 del monolito).
+export const expiryNotificationWindow = pgEnum("expiry_notification_window", [
+  "30d",
+  "7d",
+]);
+
+export const expiryNotifications = pgTable(
+  "expiry_notifications",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    orgId: uuid("org_id")
+      .notNull()
+      .references(() => organizations.id, { onDelete: "cascade" }),
+    policyId: uuid("policy_id")
+      .notNull()
+      .references(() => policies.id, { onDelete: "cascade" }),
+    window: expiryNotificationWindow("window").notNull(),
+    // Si el aviso al asegurado salió (flag EXPIRY_EMAILS_TO_CONTACTS): a qué
+    // casilla. null = solo digest interno (flag apagado o asegurado sin email).
+    contactEmail: text("contact_email"),
+    sentAt: timestamp("sent_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex("expiry_notifications_policy_window_idx").on(
+      table.policyId,
+      table.window,
+    ),
+    index("expiry_notifications_org_idx").on(table.orgId),
+  ],
+);
+
 // Allowlist de la beta privada (ex-"lista de espera", M8). Tabla global (no
 // org-scoped, es pre-cuenta): la pobla el owner manualmente (Neon/script). El
 // gate de registro (auth.ts, BETA_ALLOWLIST) lee de acá. Sin RLS ni grants al

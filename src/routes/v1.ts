@@ -8,6 +8,7 @@ import { claimsRouter } from './claims.js';
 import { policyExtras } from './policy-extras.js';
 import { contactExtras } from './contact-extras.js';
 import { documentsRouter } from './documents.js';
+import { quotesRouter } from './quotes.js';
 import { writeAuditLogTx } from '../audit.js';
 
 const isUuidV1 = (s: unknown): s is string =>
@@ -204,14 +205,6 @@ async function assembleCockpit(tx: AuthedTx, now: Date) {
     .orderBy(desc(claims.lastActivityAt))
     .limit(500);
 
-  const quoteRows = await tx
-    .select({ q: quotes })
-    .from(quotes)
-    .orderBy(desc(quotes.createdAt))
-    .limit(200);
-
-  const quoteItemRows = await tx.select().from(quoteItems).limit(1000);
-
   // Productores con agregados SQL uncapped (Fase 3 escalabilidad): pólizas,
   // prima y siniestros por productor salen de COUNT/SUM directos, NO de la
   // array capada de policies (a 10k+ los números daban truncados).
@@ -318,36 +311,6 @@ async function assembleCockpit(tx: AuthedTx, now: Date) {
     }
   }
 
-  // ---- cotizaciones ----
-  const itemsByQuote = new Map<string, typeof quoteItemRows>();
-  for (const it of quoteItemRows) {
-    (itemsByQuote.get(it.quoteId) ?? itemsByQuote.set(it.quoteId, []).get(it.quoteId)!).push(it);
-  }
-  const COTIZACIONES = quoteRows.map(({ q }) => {
-    const items = itemsByQuote.get(q.id) ?? [];
-    const best = items.reduce<(typeof items)[number] | null>(
-      (acc, it) => (acc == null || num(it.cuota) < num(acc.cuota) ? it : acc),
-      null,
-    );
-    const ageDays = Math.round((now.getTime() - q.createdAt.getTime()) / 86400000);
-    const valid = 15 - ageDays;
-    return {
-      id: q.id,
-      // La DB no tiene número de cotización: derivamos un código estable y
-      // mono-aspecto del año + sufijo del uuid. `reference` (texto libre, suele
-      // ser el nombre del cliente) va aparte en `client`.
-      num: `COT-${q.createdAt.getFullYear()}-${q.id.replace(/-/g, '').slice(-4).toUpperCase()}`,
-      client: clientOf(q.contactId) !== '—' ? clientOf(q.contactId) : (q.reference ?? '—'),
-      ramo: ramoLabel(q.ramo),
-      status: valid < 0 ? 'Vencida' : items.length > 0 ? 'Enviada' : 'Borrador',
-      best: (best?.insurerId && insurerName.get(best.insurerId)) ?? '—',
-      monthly: best ? num(best.cuota) : 0,
-      options: items.length,
-      date: q.createdAt.toISOString().slice(0, 10),
-      valid,
-    };
-  });
-
   // ---- productores (agregados SQL de producerRows, no las arrays capadas) ----
   const PRODUCTORES = producerRows.map(({ pr, polizas, prima, siniestros }) => ({
     id: pr.id,
@@ -426,7 +389,6 @@ async function assembleCockpit(tx: AuthedTx, now: Date) {
     CUOTAS,
     CROSSSELL,
     BOOK,
-    COTIZACIONES,
     PRODUCTORES,
   };
 }
@@ -517,6 +479,8 @@ v1.use('/claims', claimsRouter);
 v1.use(policyExtras);
 v1.use(contactExtras);
 v1.use(documentsRouter);
+// Slice 5: multicotizador real (historial, detalle con matriz, items a mano).
+v1.use(quotesRouter);
 
 // Corre fn dentro de withAuthedTx y responde JSON; centraliza el try/catch.
 function handle<T>(fn: (tx: AuthedTx, ctx: NonNullable<import('../db/client.js').AuthContext>) => Promise<T>) {
@@ -863,7 +827,6 @@ v1.post('/communications', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-v1.get('/cotizaciones', section('COTIZACIONES'));
 v1.get('/productores', requireOwner, section('PRODUCTORES'));
 
 // Actividad (audit_log) paginada server-side (Slice 2): antes alias capado a 40.
@@ -905,7 +868,6 @@ v1.get('/insurers', handle(async (tx) => ({ data: (await assembleCockpit(tx, new
 
 // Alias en inglés (compatibilidad con la primera versión del cliente).
 v1.get('/claims', claimsList);
-v1.get('/quotes', section('COTIZACIONES'));
 
 // KPIs agregados del dashboard.
 v1.get('/book', handle(async (tx) => (await assembleCockpit(tx, new Date())).BOOK));
@@ -1108,6 +1070,83 @@ v1.get('/contacts/picker', async (req, res, next) => {
       };
     });
     res.json(out);
+  } catch (err) { next(err); }
+});
+
+// ── Slice 5: resumen agrupado + exports CSV (registrados ANTES de /:id) ──────
+
+const csvCell = (v: unknown): string => {
+  const s = v == null ? '' : String(v);
+  return /[",\n;]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+};
+const csvSend = (res: import('express').Response, filename: string, header: string[], rows: unknown[][]) => {
+  const body = [header, ...rows].map((r) => r.map(csvCell).join(';')).join('\r\n');
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+  // BOM para que Excel AR abra UTF-8 con acentos bien.
+  res.send('﻿' + body);
+};
+
+// Vista Resumen de pólizas: agrupado por ramo o estado con subtotales de
+// premio ARS (paridad policies.summary). Uncapped: COUNT/SUM en SQL.
+v1.get('/policies/summary', async (req, res, next) => {
+  const by = req.query.by === 'estado' ? 'estado' : 'ramo';
+  try {
+    const out = await withAuthedTx(req.authCtx!, async (tx) => {
+      const col = by === 'estado' ? policies.status : policies.ramo;
+      const rows = await tx
+        .select({
+          key: sql<string>`${col}::text`,
+          count: sql<number>`count(*)::int`,
+          premio: sql<number>`coalesce(sum(coalesce(${policies.premio}, ${policies.prima})), 0)::float`,
+        })
+        .from(policies)
+        .groupBy(sql`${col}`)
+        .orderBy(sql`count(*) desc`);
+      const data = rows.map((r) => ({
+        key: r.key,
+        label: by === 'estado' ? (POLICY_STATUS_LABEL[r.key] ?? r.key) : ramoLabel(r.key),
+        count: r.count,
+        premio: r.premio,
+      }));
+      return { by, data };
+    });
+    res.json(out);
+  } catch (err) { next(err); }
+});
+
+// Export CSV de pólizas (uncapped, bajo RLS — el productor exporta lo suyo).
+v1.get('/policies/export.csv', async (req, res, next) => {
+  try {
+    const rows = await withAuthedTx(req.authCtx!, (tx) =>
+      tx.select(policyRowSelect)
+        .from(policies)
+        .leftJoin(insurers, eq(insurers.id, policies.insurerId))
+        .leftJoin(contacts, eq(contacts.id, policies.contactId))
+        .orderBy(asc(policies.endDate)),
+    );
+    const data = rows.map(mapPolicyRow);
+    csvSend(res, 'polizas.csv',
+      ['numero', 'asegurado', 'aseguradora', 'ramo', 'estado', 'inicio', 'fin', 'prima', 'forma_pago', 'observaciones'],
+      data.map((p) => [p.num, p.client, p.insurer, p.ramo, p.status, p.start, p.renew, p.prima, p.paymentMethod ?? '', p.coverage === '—' ? '' : p.coverage]));
+  } catch (err) { next(err); }
+});
+
+// Export CSV de asegurados.
+v1.get('/contacts/export.csv', async (req, res, next) => {
+  try {
+    const rows = await withAuthedTx(req.authCtx!, (tx) =>
+      tx.select().from(contacts).orderBy(asc(sql`coalesce(${contacts.legalName}, ${contacts.lastName}, ${contacts.firstName})`)),
+    );
+    csvSend(res, 'asegurados.csv',
+      ['nombre', 'tipo', 'estado', 'dni', 'cuit', 'telefono', 'ciudad', 'provincia', 'observaciones'],
+      rows.map((c) => [
+        displayName(c),
+        c.kind === 'PERSONA_JURIDICA' ? 'Empresa' : 'Persona',
+        CONTACT_STATUS_LABEL[c.status] ?? c.status,
+        c.dni ?? '', c.cuit ?? '', firstPhone(c.contactMethods),
+        c.addressCity ?? '', c.addressProvince ?? '', c.notes ?? '',
+      ]));
   } catch (err) { next(err); }
 });
 
@@ -1548,6 +1587,8 @@ v1.get('/contacts/:id', async (req, res, next) => {
         since: String(c.createdAt.getFullYear()),
         phone: firstPhone(c.contactMethods),
         contactMethods: methods,
+        // Calidad de datos 0-100 (tiers: <50 low, <80 medium, resto high).
+        quality: c.dataQualityScore ?? 0,
         tags:
           c.status === 'prospecto' ? ['Prospecto'] : c.status === 'exasegurado' ? ['Ex asegurado'] : ['Asegurado'],
         polizas,
@@ -1594,6 +1635,22 @@ v1.get('/contacts/:id', async (req, res, next) => {
 // Alta de contacto (regla de negocio del founder): nace SIEMPRE como prospecto
 // — no hay selector de estado. Pasa a cliente cuando se importa su primera
 // póliza. RLS + audit; producerId estampado server-side (producer_scope).
+// Calidad de datos (paridad computeDataQualityScore del monolito):
+// documento 30 + medio de contacto 30 + dirección (calle+localidad+provincia)
+// 25 + observaciones 15. Se recalcula en cada alta/edición.
+function qualityScoreOf(c: {
+  dni: string | null; cuit: string | null;
+  addressStreet: string | null; addressCity: string | null; addressProvince: string | null;
+  contactMethods: unknown; notes: string | null;
+}): number {
+  let s = 0;
+  if (c.dni || c.cuit) s += 30;
+  if (Array.isArray(c.contactMethods) && c.contactMethods.length > 0) s += 30;
+  if (c.addressStreet && c.addressCity && c.addressProvince) s += 25;
+  if (c.notes && c.notes.trim()) s += 15;
+  return s;
+}
+
 v1.post('/contacts', async (req, res, next) => {
   const b = (req.body ?? {}) as Record<string, unknown>;
   const kind = b.kind === 'PERSONA_JURIDICA' ? 'PERSONA_JURIDICA' : 'PERSONA_FISICA';
@@ -1627,6 +1684,12 @@ v1.post('/contacts', async (req, res, next) => {
           notes: str(b.notes),
           contactMethods,
           producerId: ctx.producerId,
+          dataQualityScore: qualityScoreOf({
+            dni: kind === 'PERSONA_FISICA' ? digits(b.dni) : null,
+            cuit: digits(b.cuit),
+            addressStreet: null, addressCity: str(b.city), addressProvince: null,
+            contactMethods, notes: str(b.notes),
+          }),
         })
         .returning({ id: contacts.id });
       if (!row) throw new Error('alta contacto: el insert no devolvió fila');
@@ -1699,6 +1762,11 @@ v1.patch('/contacts/:id', async (req, res, next) => {
         .where(eq(contacts.id, id))
         .returning({ id: contacts.id });
       if (!row) return null;
+      // Recalcular la calidad de datos sobre la fila final (update parcial).
+      const [full] = await tx.select().from(contacts).where(eq(contacts.id, id)).limit(1);
+      if (full) {
+        await tx.update(contacts).set({ dataQualityScore: qualityScoreOf(full) }).where(eq(contacts.id, id));
+      }
       await writeAuditLogTx(tx, {
         orgId: ctx.orgId, userId: ctx.userId, action: 'update_contact', entityType: 'contact', entityId: id,
       });
@@ -1778,6 +1846,81 @@ v1.post('/me/accept-terms', async (req, res, next) => {
     });
     if (!out) { res.status(404).json({ error: 'Usuario no encontrado.' }); return; }
     res.json({ termsAcceptedAt: out.termsAcceptedAt?.toISOString() ?? null });
+  } catch (err) { next(err); }
+});
+
+// ── Slice 5: cuenta (export, perfil fiscal del PAS, borrado) ─────────────────
+
+// Export completo bajo RLS (F-062): el productor exporta lo suyo, el
+// organizador toda la org. JSON descargable.
+v1.get('/account/export', async (req, res, next) => {
+  try {
+    const out = await withAuthedTx(req.authCtx!, async (tx) => ({
+      exportedAt: new Date().toISOString(),
+      contacts: await tx.select().from(contacts),
+      insurers: await tx.select().from(insurers),
+      policies: await tx.select().from(policies),
+      claims: await tx.select().from(claims),
+      installments: await tx.select().from(policyInstallments),
+      communications: await tx.select().from(schema.communications),
+    }));
+    res.setHeader('Content-Disposition', `attachment; filename="rumbo-export-${out.exportedAt.slice(0, 10)}.json"`);
+    res.json(out);
+  } catch (err) { next(err); }
+});
+
+// CUIT AR: 11 dígitos con dígito verificador (módulo 11).
+function isValidCuit(c: string): boolean {
+  if (!/^\d{11}$/.test(c)) return false;
+  const mult = [5, 4, 3, 2, 7, 6, 5, 4, 3, 2];
+  const sum = mult.reduce((a, m, i) => a + m * Number(c[i]), 0);
+  const mod = 11 - (sum % 11);
+  const dv = mod === 11 ? 0 : mod === 10 ? 9 : mod;
+  return dv === Number(c[10]);
+}
+const FISCAL_CONDITIONS = ['responsable_inscripto', 'monotributo', 'exento', 'otro'];
+
+// Perfil fiscal del PAS (F-060) — solo organizador. Audita update_org_profile.
+v1.patch('/org', requireOwner, async (req, res, next) => {
+  const b = (req.body ?? {}) as Record<string, unknown>;
+  const cuit = typeof b.cuit === 'string' ? b.cuit.replace(/\D/g, '') || null : null;
+  if (cuit !== null && !isValidCuit(cuit)) { res.status(400).json({ error: 'CUIT inválido: revisá los 11 dígitos.' }); return; }
+  const ssn = typeof b.ssnMatricula === 'string' ? b.ssnMatricula.trim().slice(0, 20) || null : null;
+  const fiscal = FISCAL_CONDITIONS.includes(String(b.fiscalCondition)) ? String(b.fiscalCondition) : null;
+  const ctx = req.authCtx!;
+  try {
+    await withAuthedTx(ctx, async (tx) => {
+      const [row] = await tx
+        .update(organizations)
+        .set({
+          cuit,
+          ssnMatricula: ssn,
+          fiscalCondition: fiscal as (typeof organizations.$inferInsert)['fiscalCondition'],
+        })
+        .where(eq(organizations.id, ctx.orgId))
+        .returning({ id: organizations.id });
+      await writeAuditLogTx(tx, {
+        orgId: ctx.orgId, userId: ctx.userId, action: 'update_org_profile', entityType: 'organization', entityId: row!.id,
+      });
+    });
+    res.json({ ok: true });
+  } catch (err) { next(err); }
+});
+
+// Borrado de cuenta + TODOS los datos (F-063, Ley 25.326) — solo organizador.
+// Operación de sistema (cliente owner): el cascade de la org elimina asegurados/
+// pólizas/siniestros/cuotas/comunicaciones/audit; el del usuario elimina
+// sesiones/credenciales/2FA. Irreversible: la UI exige confirmación tipeada.
+v1.delete('/account', requireOwner, async (req, res, next) => {
+  const ctx = req.authCtx!;
+  try {
+    const { db } = await import('../db/client.js');
+    await db.delete(organizations).where(eq(organizations.id, ctx.orgId));
+    await db.delete(schema.sessions).where(eq(schema.sessions.userId, ctx.userId));
+    await db.delete(schema.accounts).where(eq(schema.accounts.userId, ctx.userId));
+    await db.delete(schema.twoFactors).where(eq(schema.twoFactors.userId, ctx.userId));
+    await db.delete(users).where(eq(users.id, ctx.userId));
+    res.json({ ok: true });
   } catch (err) { next(err); }
 });
 

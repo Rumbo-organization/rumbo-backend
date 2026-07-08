@@ -160,15 +160,6 @@ async function assembleCockpit(tx: AuthedTx, now: Date) {
     .orderBy(asc(policies.endDate))
     .limit(1000);
 
-  const riskRows = await tx.select().from(policyRisks).limit(2000);
-  const risksByPolicy = new Map<string, string>();
-  for (const r of riskRows) {
-    if (!risksByPolicy.has(r.policyId)) {
-      const label = [r.descripcion, r.patente].filter(Boolean).join(' · ');
-      if (label) risksByPolicy.set(r.policyId, label);
-    }
-  }
-
   const installmentRows = await tx
     .select({
       i: policyInstallments,
@@ -187,13 +178,6 @@ async function assembleCockpit(tx: AuthedTx, now: Date) {
     .orderBy(desc(claims.lastActivityAt))
     .limit(500);
 
-  const claimEventRows = await tx
-    .select({ e: claimEvents, authorName: users.name })
-    .from(claimEvents)
-    .leftJoin(users, eq(users.id, claimEvents.authorUserId))
-    .orderBy(desc(claimEvents.createdAt))
-    .limit(500);
-
   const quoteRows = await tx
     .select({ q: quotes })
     .from(quotes)
@@ -202,7 +186,21 @@ async function assembleCockpit(tx: AuthedTx, now: Date) {
 
   const quoteItemRows = await tx.select().from(quoteItems).limit(1000);
 
-  const producerRows = await tx.select().from(producers).orderBy(asc(producers.name));
+  // Productores con agregados SQL uncapped (Fase 3 escalabilidad): pólizas,
+  // prima y siniestros por productor salen de COUNT/SUM directos, NO de la
+  // array capada de policies (a 10k+ los números daban truncados).
+  const producerRows = await tx
+    .select({
+      pr: producers,
+      // OJO: producers.id va literal — en un select de tabla única drizzle
+      // renderiza ${producers.id} sin calificar ("id") y adentro de la
+      // subquery con alias p queda ambiguo.
+      polizas: sql<number>`(select count(*)::int from ${policies} p where p.producer_id = producers.id and p.status = 'vigente')`,
+      prima: sql<number>`(select coalesce(sum(p.prima), 0)::float from ${policies} p where p.producer_id = producers.id and p.status = 'vigente')`,
+      siniestros: sql<number>`(select count(*)::int from ${claims} cl join ${policies} p on p.id = cl.policy_id where p.producer_id = producers.id and p.status = 'vigente')`,
+    })
+    .from(producers)
+    .orderBy(asc(producers.name));
 
   const auditRows = await tx
     .select({ a: auditLog, userName: users.name })
@@ -211,35 +209,8 @@ async function assembleCockpit(tx: AuthedTx, now: Date) {
     .orderBy(desc(auditLog.createdAt))
     .limit(40);
 
-  // Totales reales por tabla (bajo RLS = solo esta org). Sirven para avisar en el
-  // frontend cuando una lista viene capada por LIMIT (ver roadmap/PLAN-ESCALABILIDAD.md).
-  // Secuenciales: la tx usa una sola conexión (no Promise.all).
-  const totalContacts = (await tx.select({ n: sql<number>`count(*)::int` }).from(contacts))[0]?.n ?? 0;
-  const totalPolicies = (await tx.select({ n: sql<number>`count(*)::int` }).from(policies))[0]?.n ?? 0;
-  const totalClaims = (await tx.select({ n: sql<number>`count(*)::int` }).from(claims))[0]?.n ?? 0;
-
-  // ---- contactos ----
+  // ---- contactos (solo lookup interno: la array CONTACTS ya no viaja) ----
   const contactById = new Map(contactRows.map((c) => [c.id, c]));
-  const CONTACTS = contactRows.map((c) => {
-    const name = displayName(c);
-    return {
-      id: c.id,
-      name,
-      kind: c.kind === 'PERSONA_JURIDICA' ? 'Empresa' : 'Persona',
-      city: c.addressCity ?? '—',
-      initials: initialsOf(name),
-      phone: firstPhone(c.contactMethods),
-      // Documento para la búsqueda de la tabla (nombre o DNI/CUIT).
-      document: c.dni ? `DNI ${c.dni}` : c.cuit ? `CUIT ${c.cuit}` : null,
-      since: String(c.createdAt.getFullYear()),
-      tags:
-        c.status === 'prospecto'
-          ? ['Prospecto']
-          : c.status === 'exasegurado'
-            ? ['Ex asegurado']
-            : ['Asegurado'],
-    };
-  });
 
   // ---- pólizas ----
   const clientOf = (contactId: string | null): string => {
@@ -247,35 +218,8 @@ async function assembleCockpit(tx: AuthedTx, now: Date) {
     return c ? displayName(c) : '—';
   };
 
-  const installmentsByPolicy = new Map<string, number>();
-  for (const { i } of installmentRows) {
-    installmentsByPolicy.set(i.policyId, (installmentsByPolicy.get(i.policyId) ?? 0) + 1);
-  }
-  const freqOf = (policyId: string): string => {
-    const n = installmentsByPolicy.get(policyId) ?? 0;
-    if (n >= 10) return 'Mensual';
-    if (n >= 4) return 'Trimestral';
-    if (n >= 2) return 'Semestral';
-    return 'Anual';
-  };
-
-  const POLICIES = policyRows.map(({ p }) => ({
-    id: p.id,
-    num: p.policyNumber ?? '—',
-    contactId: p.contactId,
-    client: clientOf(p.contactId),
-    insurer: (p.insurerId && insurerName.get(p.insurerId)) ?? '—',
-    ramo: ramoLabel(p.ramo),
-    detail: risksByPolicy.get(p.id) ?? p.notes ?? ramoLabel(p.ramo),
-    prima: num(p.prima),
-    freq: freqOf(p.id),
-    status: POLICY_STATUS_LABEL[p.status] ?? p.status,
-    start: p.startDate,
-    renew: p.endDate,
-    coverage: p.notes ?? '—',
-    paymentMethod: paymentLabel(p.paymentMethod),
-    sumaAseg: p.sumaAsegurada == null ? null : num(p.sumaAsegurada),
-  }));
+  // La array POLICIES ya no viaja en el bootstrap (Fase 3): el listado es
+  // paginado (/policies) y el detalle directo (/policies/:id[/detail]).
   const policyById = new Map(policyRows.map(({ p }) => [p.id, p]));
 
   // ---- vencimientos: vigentes que renuevan en ≤45 días (incluye vencidas recientes) ----
@@ -355,22 +299,6 @@ async function assembleCockpit(tx: AuthedTx, now: Date) {
     }
   }
 
-  // ---- actividad por póliza (eventos de siniestros) ----
-  const ACTIVITY: Record<string, object[]> = {};
-  for (const { e, authorName } of claimEventRows) {
-    const claim = claimRows.find((c) => c.c.id === e.claimId)?.c;
-    if (!claim?.policyId) continue;
-    (ACTIVITY[claim.policyId] ??= []).push({
-      when: relativeSince(e.createdAt, now),
-      who: authorName ?? 'Sistema',
-      text:
-        e.kind === 'status_change'
-          ? `Siniestro ${claim.claimNumber ?? ''} → ${CLAIM_STATUS_LABEL[e.newStatus ?? ''] ?? e.newStatus}`
-          : (e.body ?? 'Comentario'),
-      kind: e.kind === 'status_change' ? 'event' : 'note',
-    });
-  }
-
   // ---- prospectos (contactos en pipeline) ----
   const latestQuoteByContact = new Map<string, (typeof quoteRows)[number]['q']>();
   for (const { q } of quoteRows) {
@@ -424,21 +352,17 @@ async function assembleCockpit(tx: AuthedTx, now: Date) {
     };
   });
 
-  // ---- productores ----
-  const PRODUCTORES = producerRows.map((pr) => {
-    const own = policyRows.filter(({ p }) => p.producerId === pr.id && p.status === 'vigente');
-    const ownIds = new Set(own.map(({ p }) => p.id));
-    return {
-      id: pr.id,
-      name: pr.name,
-      role: pr.isSelf ? 'Titular' : 'Productor',
-      initials: initialsOf(pr.name),
-      polizas: own.length,
-      prima: own.reduce((a, { p }) => a + num(p.prima), 0),
-      conversion: 0,
-      siniestros: claimRows.filter(({ c }) => c.policyId && ownIds.has(c.policyId)).length,
-    };
-  });
+  // ---- productores (agregados SQL de producerRows, no las arrays capadas) ----
+  const PRODUCTORES = producerRows.map(({ pr, polizas, prima, siniestros }) => ({
+    id: pr.id,
+    name: pr.name,
+    role: pr.isSelf ? 'Titular' : 'Productor',
+    initials: initialsOf(pr.name),
+    polizas: polizas ?? 0,
+    prima: prima ?? 0,
+    conversion: 0,
+    siniestros: siniestros ?? 0,
+  }));
 
   // ---- auditoría ----
   const AUDIT = auditRows.map(({ a, userName }) => {
@@ -508,28 +432,22 @@ async function assembleCockpit(tx: AuthedTx, now: Date) {
     health,
   };
 
+  // Fase 3 (escalabilidad): CONTACTS, POLICIES, ACTIVITY y COUNTS ya NO viajan.
+  // Todos sus consumidores migraron a endpoints dedicados (listados paginados,
+  // /policies/:id/detail, pickers, /crosssell). El bootstrap queda para los
+  // agregados y secciones chicas del dashboard.
   return {
     TODAY: now.toISOString().slice(0, 10),
-    CONTACTS,
     INSURERS: insurerRows.map((i) => i.name),
-    POLICIES,
     VENCIMIENTOS,
     SINIESTROS,
     CUOTAS,
     CROSSSELL,
-    ACTIVITY,
     BOOK,
     PROSPECTOS,
     COTIZACIONES,
     PRODUCTORES,
     AUDIT,
-    // Totales reales vs lo que viaja en el payload (capado por LIMIT). El frontend
-    // avisa "mostrando X de N" cuando shown < total. Ver roadmap/PLAN-ESCALABILIDAD.md.
-    COUNTS: {
-      contacts: { shown: CONTACTS.length, total: totalContacts },
-      policies: { shown: POLICIES.length, total: totalPolicies },
-      claims: { shown: SINIESTROS.length, total: totalClaims },
-    },
   };
 }
 
@@ -856,6 +774,152 @@ v1.get('/policies', async (req, res, next) => {
 
       const data = rows.map(mapPolicyRow);
       return { data, total, limit, offset };
+    });
+    res.json(out);
+  } catch (err) { next(err); }
+});
+
+// Picker liviano de pólizas (Fase 3): filas mínimas para dropdowns/typeahead
+// (denuncia de siniestro, palette). Búsqueda ILIKE server-side, límite corto.
+// Registrado ANTES de /policies/:id para que "picker" no matchee como id.
+v1.get('/policies/picker', async (req, res, next) => {
+  const qStr = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+  const limit = Math.min(Math.max(parseInt(String(req.query.limit ?? '20'), 10) || 20, 1), 50);
+  try {
+    const out = await withAuthedTx(req.authCtx!, async (tx) => {
+      const conds = [];
+      if (qStr) {
+        const like = `%${qStr}%`;
+        conds.push(sql`(
+          ${policies.policyNumber} ilike ${like}
+          or ${policies.ramo}::text ilike ${like}
+          or ${insurers.name} ilike ${like}
+          or ${contacts.firstName} ilike ${like}
+          or ${contacts.lastName} ilike ${like}
+          or ${contacts.legalName} ilike ${like}
+        )`);
+      }
+      const rows = await tx
+        .select(policyRowSelect)
+        .from(policies)
+        .leftJoin(insurers, eq(insurers.id, policies.insurerId))
+        .leftJoin(contacts, eq(contacts.id, policies.contactId))
+        .where(conds.length ? and(...conds) : undefined)
+        .orderBy(desc(policies.endDate))
+        .limit(limit);
+      return {
+        data: rows.map(mapPolicyRow).map((p) => ({
+          id: p.id, num: p.num, client: p.client, ramo: p.ramo,
+          insurer: p.insurer, detail: p.detail,
+        })),
+      };
+    });
+    res.json(out);
+  } catch (err) { next(err); }
+});
+
+// Picker liviano de contactos (Fase 3): id + nombre para dropdowns/typeahead
+// (cotizador, calendario, palette). Registrado ANTES de /contacts/:id.
+v1.get('/contacts/picker', async (req, res, next) => {
+  const qStr = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+  const limit = Math.min(Math.max(parseInt(String(req.query.limit ?? '20'), 10) || 20, 1), 50);
+  try {
+    const out = await withAuthedTx(req.authCtx!, async (tx) => {
+      const conds = [];
+      if (qStr) {
+        const like = `%${qStr}%`;
+        conds.push(sql`(
+          ${contacts.firstName} ilike ${like}
+          or ${contacts.lastName} ilike ${like}
+          or ${contacts.legalName} ilike ${like}
+          or ${contacts.dni} ilike ${like}
+          or ${contacts.cuit} ilike ${like}
+          or ${contacts.addressCity} ilike ${like}
+        )`);
+      }
+      const rows = await tx
+        .select()
+        .from(contacts)
+        .where(conds.length ? and(...conds) : undefined)
+        .orderBy(asc(sql`coalesce(${contacts.legalName}, ${contacts.lastName}, ${contacts.firstName})`))
+        .limit(limit);
+      return {
+        data: rows.map((c) => {
+          const name = displayName(c);
+          return {
+            id: c.id, name, initials: initialsOf(name),
+            kind: c.kind === 'PERSONA_JURIDICA' ? 'Empresa' : 'Persona',
+            city: c.addressCity ?? '—',
+          };
+        }),
+      };
+    });
+    res.json(out);
+  } catch (err) { next(err); }
+});
+
+// Cross-selling server-side (Fase 3): oportunidades + mapa de cobertura sobre
+// agregados por contacto (array_agg de ramos vigentes) — sin las arrays capadas
+// del bootstrap. ops paginadas (Alta primero); matriz limitada a 40 filas
+// (contactos con oportunidad primero). counts.bySuggest permite estimar prima
+// potencial total en el frontend sin bajar todas las ops.
+v1.get('/crosssell', async (req, res, next) => {
+  const limit = Math.min(Math.max(parseInt(String(req.query.limit ?? '50'), 10) || 50, 1), 200);
+  const offset = Math.max(parseInt(String(req.query.offset ?? '0'), 10) || 0, 0);
+  try {
+    const out = await withAuthedTx(req.authCtx!, async (tx) => {
+      const rows = await tx
+        .select({
+          id: contacts.id,
+          kind: contacts.kind,
+          firstName: contacts.firstName,
+          lastName: contacts.lastName,
+          legalName: contacts.legalName,
+          // ::text — node-postgres no parsea arrays de enum (OID custom) y
+          // devolvería el literal '{...}' como string; text[] sí se parsea.
+          ramos: sql<string[]>`array_agg(distinct ${policies.ramo}::text)`,
+        })
+        .from(contacts)
+        .innerJoin(policies, and(eq(policies.contactId, contacts.id), eq(policies.status, 'vigente')))
+        .groupBy(contacts.id)
+        .orderBy(asc(sql`coalesce(${contacts.legalName}, ${contacts.lastName}, ${contacts.firstName})`));
+
+      const all = rows.map((r) => {
+        const name = displayName(r);
+        const ramos = new Set<string>(r.ramos ?? []);
+        const rule = CROSS_RULES.find((cr) => ramos.has(cr.have) && !ramos.has(cr.lack)) ?? null;
+        return { r, name, ramos, rule };
+      });
+
+      const opsAll = all.filter((x) => x.rule);
+      opsAll.sort((a, b) =>
+        ((b.rule!.score === 'Alta' ? 1 : 0) - (a.rule!.score === 'Alta' ? 1 : 0)) || a.name.localeCompare(b.name));
+      const ops = opsAll.slice(offset, offset + limit).map(({ r, name, ramos, rule }) => ({
+        id: `x-${r.id}-${rule!.suggest}`,
+        contactId: r.id,
+        client: name,
+        initials: initialsOf(name),
+        has: [...ramos].map(ramoLabel),
+        suggest: rule!.suggest,
+        reason: rule!.reason,
+        score: rule!.score,
+      }));
+
+      const bySuggest: Record<string, number> = {};
+      for (const o of opsAll) bySuggest[o.rule!.suggest] = (bySuggest[o.rule!.suggest] ?? 0) + 1;
+
+      const matrix = [...opsAll, ...all.filter((x) => !x.rule)].slice(0, 40).map(({ r, name, ramos, rule }) => ({
+        id: r.id,
+        name,
+        ramos: [...ramos].map(ramoLabel),
+        suggest: rule ? rule.suggest : null,
+      }));
+
+      return {
+        ops, total: opsAll.length, limit, offset,
+        counts: { altas: opsAll.filter((x) => x.rule!.score === 'Alta').length, bySuggest },
+        matrix, matrixTotal: all.length,
+      };
     });
     res.json(out);
   } catch (err) { next(err); }

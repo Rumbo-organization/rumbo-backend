@@ -269,8 +269,9 @@ calendar.get('/', async (req: Request, res: Response, next: NextFunction) => {
         .orderBy(asc(claims.occurredAt));
 
       const eventos = await tx
-        .select()
+        .select({ e: calendarEvents, ...contactNameFields })
         .from(calendarEvents)
+        .leftJoin(contacts, eq(contacts.id, calendarEvents.contactId))
         .where(and(gte(calendarEvents.date, from), lte(calendarEvents.date, to)))
         .orderBy(asc(calendarEvents.date), asc(calendarEvents.time));
 
@@ -300,7 +301,12 @@ calendar.get('/', async (req: Request, res: Response, next: NextFunction) => {
           status: CLAIM_STATUS_LABEL[s.status] ?? s.status,
           client: displayName(s),
         })),
-        eventos: eventos.map(eventShape),
+        // contactName: para precargar el typeahead al editar (Fase 3: el
+        // frontend ya no tiene CONTACTS del bootstrap para resolver el id).
+        eventos: eventos.map((r) => ({
+          ...eventShape(r.e),
+          contactName: r.e.contactId ? displayName({ ...r, contactKind: r.contactKind ?? 'PERSONA_FISICA' }) : null,
+        })),
       };
     });
     res.json(data);

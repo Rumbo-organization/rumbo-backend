@@ -55,6 +55,9 @@ export const users = pgTable("users", {
   image: text("image"),
   // Plugin twoFactor (F-003).
   twoFactorEnabled: boolean("two_factor_enabled").notNull().default(false),
+  // Aceptación de Términos y Privacidad (Ley 25.326): checkbox en el registro
+  // o modal única vez al iniciar sesión (migración 0003). Null = no aceptó aún.
+  termsAcceptedAt: timestamp("terms_accepted_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true })
     .notNull()
     .defaultNow(),

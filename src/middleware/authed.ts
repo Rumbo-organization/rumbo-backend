@@ -87,3 +87,16 @@ export async function requireAuthedOrg(
     next(err);
   }
 }
+
+// Gate de organizador (equivalente del organizadorProcedure del viejo): solo
+// members role='owner'. Corre DESPUÉS de requireAuthedOrg (necesita authCtx).
+// RLS ya limita los datos, pero las secciones/acciones de organizador
+// (analytics cross-productor, datos del PAS, borrado de cuenta) se niegan
+// enteras para productores.
+export function requireOwner(req: Request, res: Response, next: NextFunction): void {
+  if (req.authCtx?.role !== 'owner') {
+    res.status(403).json({ error: 'Sección del organizador.' });
+    return;
+  }
+  next();
+}

@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { and, asc, desc, eq, inArray, sql } from 'drizzle-orm';
 
-import { requireAuthedOrg } from '../middleware/authed.js';
+import { requireAuthedOrg, requireOwner } from '../middleware/authed.js';
 import { withAuthedTx, schema, type AuthedTx } from '../db/client.js';
 import { calendar } from './calendar.js';
 import { claimsRouter } from './claims.js';
@@ -502,10 +502,22 @@ function handle<T>(fn: (tx: AuthedTx, ctx: NonNullable<import('../db/client.js')
 v1.get('/bootstrap', handle(async (tx, ctx) => {
   const now = new Date();
   const [cockpit, org] = [await assembleCockpit(tx, now), await loadOrg(tx)];
+  // termsAcceptedAt: gatea el modal de legales de única vez en el frontend
+  // (cuentas creadas antes del checkbox del registro). RLS self_isolation.
+  const [me] = await tx
+    .select({ termsAcceptedAt: users.termsAcceptedAt })
+    .from(users)
+    .where(eq(users.id, ctx.userId))
+    .limit(1);
   return {
     ...cockpit,
     ORG: org,
-    ME: { role: ctx.role, roleLabel: ROLE_LABEL[ctx.role] ?? 'Productor', producerId: ctx.producerId },
+    ME: {
+      role: ctx.role,
+      roleLabel: ROLE_LABEL[ctx.role] ?? 'Productor',
+      producerId: ctx.producerId,
+      termsAcceptedAt: me?.termsAcceptedAt?.toISOString() ?? null,
+    },
   };
 }));
 
@@ -642,7 +654,7 @@ v1.get('/cuotas', section('CUOTAS'));
 v1.get('/crossselling', section('CROSSSELL'));
 v1.get('/prospectos', section('PROSPECTOS'));
 v1.get('/cotizaciones', section('COTIZACIONES'));
-v1.get('/productores', section('PRODUCTORES'));
+v1.get('/productores', requireOwner, section('PRODUCTORES'));
 v1.get('/actividad', section('AUDIT'));
 v1.get('/insurers', handle(async (tx) => ({ data: (await assembleCockpit(tx, new Date())).INSURERS })));
 
@@ -1033,7 +1045,24 @@ v1.get('/policies/:id/detail', async (req, res, next) => {
         }
       }
 
-      return { policy, contact, siniestros, crosssell, activity };
+      // Plan de pagos REAL (policy_installments). Antes el frontend proyectaba
+      // cuotas desde prima/frecuencia — números inventados con datos reales.
+      const instRows = await tx
+        .select({
+          i: policyInstallments,
+          daysFromDue: sql<number>`(current_date - ${policyInstallments.dueDate})::int`,
+        })
+        .from(policyInstallments)
+        .where(eq(policyInstallments.policyId, id))
+        .orderBy(asc(policyInstallments.number));
+      const installments = instRows.map(({ i, daysFromDue }) => ({
+        cuota: i.number,
+        date: i.dueDate,
+        amount: i.amount == null ? 0 : Number(i.amount),
+        status: i.paidAt != null ? 'Pagada' : daysFromDue > 0 ? 'Vencida' : daysFromDue >= -8 ? 'Por vencer' : 'Programada',
+      }));
+
+      return { policy, contact, siniestros, crosssell, activity, installments };
     });
     if (!out) { res.status(404).json({ error: 'Póliza no encontrada' }); return; }
     res.json(out);
@@ -1313,28 +1342,73 @@ v1.patch('/contacts/:id', async (req, res, next) => {
 
 // Edición de póliza: SOLO observaciones (regla del founder — las pólizas se
 // importan de las aseguradoras; el resto es read-only). RLS oculta lo ajeno → 404.
+// Lo único editable de una póliza (read-only por decisión de producto): las
+// observaciones y la forma de pago. Cada campo audita su propia acción (paridad
+// con update_policy_notes / update_policy_payment_method del viejo).
 v1.patch('/policies/:id', async (req, res, next) => {
   const id = req.params.id;
   if (!isUuidV1(id)) { res.status(400).json({ error: 'Id inválido.' }); return; }
   const body = (req.body ?? {}) as Record<string, unknown>;
-  const notes = typeof body.notes === 'string' ? body.notes.trim() : '';
+  const hasNotes = typeof body.notes === 'string';
+  const notes = hasNotes ? (body.notes as string).trim() : '';
   if (notes.length > 4000) { res.status(400).json({ error: 'Observaciones demasiado largas.' }); return; }
+  const hasPayment = 'paymentMethod' in body;
+  const paymentRaw = body.paymentMethod;
+  const payment = paymentRaw == null || paymentRaw === '' ? null : String(paymentRaw);
+  if (hasPayment && payment !== null && !PAYMENT_METHOD_LABEL[payment]) {
+    res.status(400).json({ error: 'Forma de pago inválida.' }); return;
+  }
+  if (!hasNotes && !hasPayment) { res.status(400).json({ error: 'Nada para actualizar.' }); return; }
+  const ctx = req.authCtx!;
+  try {
+    const out = await withAuthedTx(ctx, async (tx) => {
+      const set: Record<string, unknown> = { updatedAt: new Date() };
+      if (hasNotes) set.notes = notes || null;
+      if (hasPayment) set.paymentMethod = payment;
+      const [row] = await tx
+        .update(policies)
+        .set(set)
+        .where(eq(policies.id, id))
+        .returning({ id: policies.id, notes: policies.notes, paymentMethod: policies.paymentMethod });
+      if (!row) return null;
+      if (hasNotes) {
+        await writeAuditLogTx(tx, {
+          orgId: ctx.orgId, userId: ctx.userId, action: 'update_policy_notes', entityType: 'policy', entityId: id,
+        });
+      }
+      if (hasPayment) {
+        await writeAuditLogTx(tx, {
+          orgId: ctx.orgId, userId: ctx.userId, action: 'update_policy_payment_method', entityType: 'policy', entityId: id,
+          payload: { paymentMethod: payment },
+        });
+      }
+      return row;
+    });
+    if (!out) { res.status(404).json({ error: 'Póliza no encontrada.' }); return; }
+    res.json({ id: out.id, notes: out.notes, paymentMethod: paymentLabel(out.paymentMethod) });
+  } catch (err) { next(err); }
+});
+
+// Aceptación de Términos y Privacidad (Ley 25.326): la marca el propio usuario
+// (checkbox del registro o modal única vez al iniciar sesión). Idempotente: si
+// ya aceptó, no pisa la fecha original. RLS self_isolation limita a la fila propia.
+v1.post('/me/accept-terms', async (req, res, next) => {
   const ctx = req.authCtx!;
   try {
     const out = await withAuthedTx(ctx, async (tx) => {
       const [row] = await tx
-        .update(policies)
-        .set({ notes: notes || null, updatedAt: new Date() })
-        .where(eq(policies.id, id))
-        .returning({ id: policies.id, notes: policies.notes });
+        .update(users)
+        .set({ termsAcceptedAt: sql`coalesce(${users.termsAcceptedAt}, now())`, updatedAt: new Date() })
+        .where(eq(users.id, ctx.userId))
+        .returning({ termsAcceptedAt: users.termsAcceptedAt });
       if (!row) return null;
       await writeAuditLogTx(tx, {
-        orgId: ctx.orgId, userId: ctx.userId, action: 'update_policy_notes', entityType: 'policy', entityId: id,
+        orgId: ctx.orgId, userId: ctx.userId, action: 'accept_terms', entityType: 'user', entityId: ctx.userId,
       });
       return row;
     });
-    if (!out) { res.status(404).json({ error: 'Póliza no encontrada.' }); return; }
-    res.json({ id: out.id, notes: out.notes });
+    if (!out) { res.status(404).json({ error: 'Usuario no encontrado.' }); return; }
+    res.json({ termsAcceptedAt: out.termsAcceptedAt?.toISOString() ?? null });
   } catch (err) { next(err); }
 });
 

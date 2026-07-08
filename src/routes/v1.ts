@@ -599,6 +599,7 @@ v1.get('/contacts', async (req, res, next) => {
 v1.get('/vencimientos', async (req, res, next) => {
   const windowDays = req.query.window === '30' ? 30 : req.query.window === '90' ? 90 : null;
   const pay = typeof req.query.pay === 'string' ? req.query.pay : '';
+  const producer = typeof req.query.producer === 'string' && isUuidV1(req.query.producer) ? req.query.producer : '';
   const limit = Math.min(Math.max(parseInt(String(req.query.limit ?? '50'), 10) || 50, 1), 200);
   const offset = Math.max(parseInt(String(req.query.offset ?? '0'), 10) || 0, 0);
 
@@ -608,6 +609,7 @@ v1.get('/vencimientos', async (req, res, next) => {
       if (windowDays) conds.push(sql`(${policies.endDate} - current_date) <= ${windowDays}`);
       if (pay === '__none__') conds.push(sql`${policies.paymentMethod} is null`);
       else if (pay && PAYMENT_METHOD_LABEL[pay]) conds.push(sql`${policies.paymentMethod} = ${pay}`);
+      if (producer) conds.push(eq(policies.producerId, producer));
       const where = and(...conds);
 
       const rows = await tx
@@ -943,6 +945,7 @@ v1.get('/policies', async (req, res, next) => {
   const seg = typeof req.query.seg === 'string' ? req.query.seg : 'todas';
   const pay = typeof req.query.pay === 'string' ? req.query.pay : '';
   const sortKey = typeof req.query.sort === 'string' ? req.query.sort : 'renew';
+  const producer = typeof req.query.producer === 'string' && isUuidV1(req.query.producer) ? req.query.producer : '';
   const dir = req.query.dir === 'desc' ? 'desc' : 'asc';
   const limit = Math.min(Math.max(parseInt(String(req.query.limit ?? '50'), 10) || 50, 1), 200);
   const offset = Math.max(parseInt(String(req.query.offset ?? '0'), 10) || 0, 0);
@@ -965,6 +968,7 @@ v1.get('/policies', async (req, res, next) => {
       if (seg === 'porvencer') conds.push(sql`(${policies.endDate} - current_date) <= 30`);
       else if (seg === 'siniestro') conds.push(sql`exists (select 1 from ${claims} cl where cl.policy_id = ${policies.id})`);
       else if (seg === 'flota') conds.push(sql`(${policies.notes} ilike '%flota%' or exists (select 1 from ${policyRisks} r where r.policy_id = ${policies.id} and r.descripcion ilike '%flota%'))`);
+      if (producer) conds.push(eq(policies.producerId, producer));
       if (pay && PAYMENT_METHOD_LABEL[pay]) conds.push(sql`${policies.paymentMethod} = ${pay}`);
       const where = conds.length ? and(...conds) : undefined;
 
@@ -1846,6 +1850,146 @@ v1.post('/me/accept-terms', async (req, res, next) => {
     });
     if (!out) { res.status(404).json({ error: 'Usuario no encontrado.' }); return; }
     res.json({ termsAcceptedAt: out.termsAcceptedAt?.toISOString() ?? null });
+  } catch (err) { next(err); }
+});
+
+// ── Slice 6: plantillas de mensajes propias del PAS (paridad E7/O-49) ────────
+// Los 4 built-in viven en el frontend; estas son las que el PAS crea/edita,
+// compartidas en la org (RLS). Variables {nombre} {poliza} {vencimiento}.
+
+v1.get('/message-templates', handle(async (tx) => ({
+  data: await tx
+    .select({ id: schema.messageTemplates.id, name: schema.messageTemplates.name, body: schema.messageTemplates.body })
+    .from(schema.messageTemplates)
+    .orderBy(asc(schema.messageTemplates.name)),
+})));
+
+v1.post('/message-templates', async (req, res, next) => {
+  const b = (req.body ?? {}) as Record<string, unknown>;
+  const name = typeof b.name === 'string' ? b.name.trim().slice(0, 60) : '';
+  const bodyText = typeof b.body === 'string' ? b.body.trim().slice(0, 2000) : '';
+  if (!name || !bodyText) { res.status(400).json({ error: 'Nombre y texto son obligatorios.' }); return; }
+  const ctx = req.authCtx!;
+  try {
+    const out = await withAuthedTx(ctx, async (tx) => {
+      const [row] = await tx.insert(schema.messageTemplates).values({ orgId: ctx.orgId, name, body: bodyText }).returning({ id: schema.messageTemplates.id });
+      await writeAuditLogTx(tx, {
+        orgId: ctx.orgId, userId: ctx.userId, action: 'create_message_template', entityType: 'message_template', entityId: row!.id,
+      });
+      return row;
+    });
+    res.status(201).json(out);
+  } catch (err) { next(err); }
+});
+
+v1.patch('/message-templates/:id', async (req, res, next) => {
+  const id = req.params.id;
+  if (!isUuidV1(id)) { res.status(400).json({ error: 'Id inválido.' }); return; }
+  const b = (req.body ?? {}) as Record<string, unknown>;
+  const name = typeof b.name === 'string' ? b.name.trim().slice(0, 60) : '';
+  const bodyText = typeof b.body === 'string' ? b.body.trim().slice(0, 2000) : '';
+  if (!name || !bodyText) { res.status(400).json({ error: 'Nombre y texto son obligatorios.' }); return; }
+  const ctx = req.authCtx!;
+  try {
+    const out = await withAuthedTx(ctx, async (tx) => {
+      const [row] = await tx.update(schema.messageTemplates).set({ name, body: bodyText, updatedAt: new Date() })
+        .where(eq(schema.messageTemplates.id, id)).returning({ id: schema.messageTemplates.id });
+      if (!row) return null;
+      await writeAuditLogTx(tx, {
+        orgId: ctx.orgId, userId: ctx.userId, action: 'update_message_template', entityType: 'message_template', entityId: row.id,
+      });
+      return row;
+    });
+    if (!out) { res.status(404).json({ error: 'Plantilla no encontrada.' }); return; }
+    res.json({ ok: true });
+  } catch (err) { next(err); }
+});
+
+v1.delete('/message-templates/:id', async (req, res, next) => {
+  const id = req.params.id;
+  if (!isUuidV1(id)) { res.status(400).json({ error: 'Id inválido.' }); return; }
+  const ctx = req.authCtx!;
+  try {
+    const out = await withAuthedTx(ctx, async (tx) => {
+      const [row] = await tx.delete(schema.messageTemplates).where(eq(schema.messageTemplates.id, id)).returning({ id: schema.messageTemplates.id });
+      if (!row) return null;
+      await writeAuditLogTx(tx, {
+        orgId: ctx.orgId, userId: ctx.userId, action: 'delete_message_template', entityType: 'message_template', entityId: row.id,
+      });
+      return row;
+    });
+    if (!out) { res.status(404).json({ error: 'Plantilla no encontrada.' }); return; }
+    res.json({ ok: true });
+  } catch (err) { next(err); }
+});
+
+// ── Slice 6: import de asegurados (paridad contacts.import) ─────────────────
+// Bulk insert con dedup por dni/cuit contra la DB y dentro del batch. La UI
+// (drawer Importar CSV) parsea y mapea client-side; acá llegan filas limpias.
+v1.post('/contacts/import', async (req, res, next) => {
+  const rowsIn = (req.body ?? {}).rows;
+  if (!Array.isArray(rowsIn) || rowsIn.length === 0) { res.status(400).json({ error: 'Sin filas para importar.' }); return; }
+  if (rowsIn.length > 5000) { res.status(400).json({ error: 'Máximo 5000 filas por import.' }); return; }
+  const ctx = req.authCtx!;
+  const str = (v: unknown, max = 200): string | null => (typeof v === 'string' && v.trim() !== '' ? v.trim().slice(0, max) : null);
+  const digits = (v: unknown): string | null => (typeof v === 'string' ? v.replace(/\D/g, '') : '') || null;
+  try {
+    const out = await withAuthedTx(ctx, async (tx) => {
+      const existing = await tx.select({ dni: contacts.dni, cuit: contacts.cuit }).from(contacts);
+      const seenDni = new Set(existing.map((e) => e.dni).filter(Boolean) as string[]);
+      const seenCuit = new Set(existing.map((e) => e.cuit).filter(Boolean) as string[]);
+
+      const toInsert: (typeof contacts.$inferInsert)[] = [];
+      let skippedDuplicates = 0;
+      let skippedInvalid = 0;
+      for (const raw of rowsIn as Record<string, unknown>[]) {
+        const kind = raw.kind === 'PERSONA_JURIDICA' ? 'PERSONA_JURIDICA' as const : 'PERSONA_FISICA' as const;
+        const firstName = kind === 'PERSONA_FISICA' ? str(raw.firstName, 80) : null;
+        const lastName = kind === 'PERSONA_FISICA' ? str(raw.lastName, 80) : null;
+        const legalName = kind === 'PERSONA_JURIDICA' ? str(raw.legalName, 160) : null;
+        if (kind === 'PERSONA_JURIDICA' ? !legalName : (!firstName && !lastName)) { skippedInvalid++; continue; }
+        const dni = kind === 'PERSONA_FISICA' ? digits(raw.dni) : null;
+        const cuit = digits(raw.cuit);
+        if ((dni && seenDni.has(dni)) || (cuit && seenCuit.has(cuit))) { skippedDuplicates++; continue; }
+        if (dni) seenDni.add(dni);
+        if (cuit) seenCuit.add(cuit);
+        const methods: Array<{ type: 'telefono' | 'celular' | 'email'; value: string; primary: boolean }> = [];
+        const phone = str(raw.phone, 40);
+        const email = str(raw.email, 120);
+        if (phone) methods.push({ type: 'celular', value: phone, primary: true });
+        if (email) methods.push({ type: 'email', value: email, primary: methods.length === 0 });
+        const row: typeof contacts.$inferInsert = {
+          orgId: ctx.orgId,
+          producerId: ctx.producerId,
+          kind, firstName, lastName, legalName, dni, cuit,
+          status: raw.status === 'prospecto' ? 'prospecto' : 'asegurado',
+          notes: str(raw.notes, 4000),
+          addressStreet: str(raw.addressStreet, 120),
+          addressCity: str(raw.addressCity, 120),
+          addressProvince: str(raw.addressProvince, 120),
+          contactMethods: methods,
+          source: 'import_csv',
+        };
+        row.dataQualityScore = qualityScoreOf({
+          dni: row.dni ?? null, cuit: row.cuit ?? null,
+          addressStreet: row.addressStreet ?? null, addressCity: row.addressCity ?? null, addressProvince: row.addressProvince ?? null,
+          contactMethods: methods, notes: row.notes ?? null,
+        });
+        toInsert.push(row);
+      }
+
+      let created = 0;
+      if (toInsert.length > 0) {
+        const inserted = await tx.insert(contacts).values(toInsert).returning({ id: contacts.id });
+        created = inserted.length;
+      }
+      await writeAuditLogTx(tx, {
+        orgId: ctx.orgId, userId: ctx.userId, action: 'import_contacts', entityType: 'contact',
+        payload: { created, skippedDuplicates, skippedInvalid, total: rowsIn.length },
+      });
+      return { created, skippedDuplicates, skippedInvalid, total: rowsIn.length };
+    });
+    res.json(out);
   } catch (err) { next(err); }
 });
 

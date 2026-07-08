@@ -62,23 +62,30 @@ documentsRouter.post('/documents/upload', upload.single('file'), wrap(async (req
   const key = documentKey(ctx.orgId, docId);
   await putObject(key, new Uint8Array(file.buffer), contentType);
 
-  await withAuthedTx(ctx, async (tx) => {
-    const [row] = await tx.insert(documents).values({
-      id: docId,
-      orgId: ctx.orgId,
-      policyId,
-      contactId,
-      fileName: file.originalname || 'documento',
-      contentType,
-      sizeBytes: file.size,
-      storageKey: key,
-      uploadedByUserId: ctx.userId,
-    }).returning({ id: documents.id });
-    await writeAuditLogTx(tx, {
-      orgId: ctx.orgId, userId: ctx.userId, action: 'upload_document', entityType: 'document', entityId: row!.id,
-      payload: policyId ? { policyId } : { contactId },
+  try {
+    await withAuthedTx(ctx, async (tx) => {
+      const [row] = await tx.insert(documents).values({
+        id: docId,
+        orgId: ctx.orgId,
+        policyId,
+        contactId,
+        fileName: file.originalname || 'documento',
+        contentType,
+        sizeBytes: file.size,
+        storageKey: key,
+        uploadedByUserId: ctx.userId,
+      }).returning({ id: documents.id });
+      await writeAuditLogTx(tx, {
+        orgId: ctx.orgId, userId: ctx.userId, action: 'upload_document', entityType: 'document', entityId: row!.id,
+        payload: policyId ? { policyId } : { contactId },
+      });
     });
-  });
+  } catch (err) {
+    // Si la metadata no se pudo guardar, el objeto ya subido queda huérfano en
+    // R2: limpiarlo best-effort antes de propagar el error.
+    await deleteObject(key).catch(() => {});
+    throw err;
+  }
   res.status(201).json({ id: docId });
 }));
 
@@ -104,25 +111,30 @@ documentsRouter.get('/documents/:id', wrap(async (req, res) => {
   res.send(buf);
 }));
 
-// Borrado: objeto en R2 + metadata en la MISMA tx (si R2 falla, rollback).
+// Borrado: metadata primero (tx con audit); el objeto de R2 se borra DESPUÉS
+// del commit. Antes el delete de R2 corría adentro de la tx: si la tx revertía
+// después, la fila quedaba apuntando a un objeto ya borrado (download roto).
+// Al revés el peor caso es un objeto huérfano en R2, inaccesible y re-borrable.
 documentsRouter.delete('/documents/:id', wrap(async (req, res) => {
   const id = req.params.id;
   if (!isUuid(id)) { res.status(400).json({ error: 'Id inválido.' }); return; }
   const ctx = req.authCtx!;
   const out = await withAuthedTx(ctx, async (tx) => {
     const [doc] = await tx
-      .select({ id: documents.id, storageKey: documents.storageKey })
-      .from(documents)
+      .delete(documents)
       .where(eq(documents.id, id))
-      .limit(1);
+      .returning({ id: documents.id, storageKey: documents.storageKey });
     if (!doc) return null;
-    if (isR2Configured()) await deleteObject(doc.storageKey);
-    await tx.delete(documents).where(eq(documents.id, id));
     await writeAuditLogTx(tx, {
       orgId: ctx.orgId, userId: ctx.userId, action: 'delete_document', entityType: 'document', entityId: doc.id,
     });
     return doc;
   });
   if (!out) { res.status(404).json({ error: 'Documento no encontrado.' }); return; }
+  if (isR2Configured()) {
+    await deleteObject(out.storageKey).catch((e) => {
+      console.error(`[documents] R2 delete falló para ${out.storageKey} (metadata ya borrada):`, e);
+    });
+  }
   res.json({ ok: true });
 }));

@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { and, asc, desc, eq, inArray, sql } from 'drizzle-orm';
 
 import { requireAuthedOrg, requireOwner } from '../middleware/authed.js';
-import { withAuthedTx, schema, type AuthedTx } from '../db/client.js';
+import { db, withAuthedTx, schema, type AuthedTx } from '../db/client.js';
 import { calendar } from './calendar.js';
 import { claimsRouter } from './claims.js';
 import { policyExtras } from './policy-extras.js';
@@ -147,7 +147,10 @@ function relativeWhen(d: Date, now: Date): string {
   const dayDiff = Math.round((Date.parse(day(now)) - Date.parse(day(d))) / 86400000);
   if (dayDiff <= 0) return `Hoy ${hm}`;
   if (dayDiff === 1) return `Ayer ${hm}`;
-  return `${d.getDate()} ${MONTHS_AR[d.getMonth()]} ${hm}`;
+  // Día/mes también en TZ AR: getDate()/getMonth() usan la TZ del server (UTC
+  // en Vercel) y cerca de medianoche mostraban el día corrido.
+  const [, m = 1, dd = 1] = day(d).split('-').map(Number);
+  return `${dd} ${MONTHS_AR[m - 1]} ${hm}`;
 }
 
 function relativeSince(d: Date, now: Date): string {
@@ -866,7 +869,10 @@ v1.get('/actividad', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-v1.get('/insurers', handle(async (tx) => ({ data: (await assembleCockpit(tx, new Date())).INSURERS })));
+// Consulta directa: la lista de nombres no necesita rearmar el cockpit entero.
+v1.get('/insurers', handle(async (tx) => ({
+  data: (await tx.select({ name: insurers.name }).from(insurers).orderBy(asc(insurers.name))).map((i) => i.name),
+})));
 
 // Alias en inglés (compatibilidad con la primera versión del cliente).
 v1.get('/claims', claimsList);
@@ -1319,7 +1325,12 @@ v1.get('/policies/:id/detail', async (req, res, next) => {
 
       const crosssell: object[] = [];
       if (policy.contactId) {
-        const ramoRows = await tx.select({ ramo: policies.ramo }).from(policies).where(eq(policies.contactId, policy.contactId));
+        // Solo vigentes: mismo criterio que el cockpit y /crosssell (una póliza
+        // vencida no cuenta como cobertura que ya tiene).
+        const ramoRows = await tx
+          .select({ ramo: policies.ramo })
+          .from(policies)
+          .where(and(eq(policies.contactId, policy.contactId), eq(policies.status, 'vigente')));
         const ramos = new Set<string>(ramoRows.map((r) => r.ramo));
         for (const rule of CROSS_RULES) {
           if (ramos.has(rule.have) && !ramos.has(rule.lack)) {
@@ -1418,9 +1429,11 @@ const METHOD_TYPE_LABEL: Record<string, string> = {
 const FREQ_MULT: Record<string, number> = { Mensual: 12, Trimestral: 4, Semestral: 2, Anual: 1 };
 
 v1.get('/contacts/:id', async (req, res, next) => {
+  const id = req.params.id;
+  if (!isUuidV1(id)) { res.status(400).json({ error: 'Id inválido.' }); return; }
   try {
     const data = await withAuthedTx(req.authCtx!, async (tx) => {
-      const [c] = await tx.select().from(contacts).where(eq(contacts.id, req.params.id)).limit(1);
+      const [c] = await tx.select().from(contacts).where(eq(contacts.id, id)).limit(1);
       if (!c) return null;
 
       const name = displayName(c);
@@ -1934,8 +1947,14 @@ v1.post('/contacts/import', async (req, res, next) => {
   const str = (v: unknown, max = 200): string | null => (typeof v === 'string' && v.trim() !== '' ? v.trim().slice(0, max) : null);
   const digits = (v: unknown): string | null => (typeof v === 'string' ? v.replace(/\D/g, '') : '') || null;
   try {
+    // Dedup contra TODA la org (cliente owner, scopeado por org_id a mano): bajo
+    // RLS un productor solo ve su cartera y podía re-importar un DNI/CUIT que ya
+    // existe en la cartera de otro productor de la misma org.
+    const existing = await db
+      .select({ dni: contacts.dni, cuit: contacts.cuit })
+      .from(contacts)
+      .where(eq(contacts.orgId, ctx.orgId));
     const out = await withAuthedTx(ctx, async (tx) => {
-      const existing = await tx.select({ dni: contacts.dni, cuit: contacts.cuit }).from(contacts);
       const seenDni = new Set(existing.map((e) => e.dni).filter(Boolean) as string[]);
       const seenCuit = new Set(existing.map((e) => e.cuit).filter(Boolean) as string[]);
 
@@ -2019,7 +2038,10 @@ function isValidCuit(c: string): boolean {
   const mult = [5, 4, 3, 2, 7, 6, 5, 4, 3, 2];
   const sum = mult.reduce((a, m, i) => a + m * Number(c[i]), 0);
   const mod = 11 - (sum % 11);
-  const dv = mod === 11 ? 0 : mod === 10 ? 9 : mod;
+  // dv 10 no existe: AFIP reasigna el prefijo en esos casos (23/33) — un CUIT
+  // cuyo cálculo da 10 es inválido, no "dv 9".
+  if (mod === 10) return false;
+  const dv = mod === 11 ? 0 : mod;
   return dv === Number(c[10]);
 }
 const FISCAL_CONDITIONS = ['responsable_inscripto', 'monotributo', 'exento', 'otro'];
@@ -2027,20 +2049,29 @@ const FISCAL_CONDITIONS = ['responsable_inscripto', 'monotributo', 'exento', 'ot
 // Perfil fiscal del PAS (F-060) — solo organizador. Audita update_org_profile.
 v1.patch('/org', requireOwner, async (req, res, next) => {
   const b = (req.body ?? {}) as Record<string, unknown>;
-  const cuit = typeof b.cuit === 'string' ? b.cuit.replace(/\D/g, '') || null : null;
-  if (cuit !== null && !isValidCuit(cuit)) { res.status(400).json({ error: 'CUIT inválido: revisá los 11 dígitos.' }); return; }
-  const ssn = typeof b.ssnMatricula === 'string' ? b.ssnMatricula.trim().slice(0, 20) || null : null;
-  const fiscal = FISCAL_CONDITIONS.includes(String(b.fiscalCondition)) ? String(b.fiscalCondition) : null;
+  // Update PARCIAL (API pública, D-026): solo toca las claves presentes en el
+  // body — un consumidor que manda solo { cuit } no borra matrícula ni fiscal.
+  const set: Partial<typeof organizations.$inferInsert> = {};
+  if ('cuit' in b) {
+    const cuit = typeof b.cuit === 'string' ? b.cuit.replace(/\D/g, '') || null : null;
+    if (cuit !== null && !isValidCuit(cuit)) { res.status(400).json({ error: 'CUIT inválido: revisá los 11 dígitos.' }); return; }
+    set.cuit = cuit;
+  }
+  if ('ssnMatricula' in b) {
+    set.ssnMatricula = typeof b.ssnMatricula === 'string' ? b.ssnMatricula.trim().slice(0, 20) || null : null;
+  }
+  if ('fiscalCondition' in b) {
+    set.fiscalCondition = (FISCAL_CONDITIONS.includes(String(b.fiscalCondition))
+      ? String(b.fiscalCondition)
+      : null) as (typeof organizations.$inferInsert)['fiscalCondition'];
+  }
+  if (Object.keys(set).length === 0) { res.status(400).json({ error: 'Nada para actualizar.' }); return; }
   const ctx = req.authCtx!;
   try {
     await withAuthedTx(ctx, async (tx) => {
       const [row] = await tx
         .update(organizations)
-        .set({
-          cuit,
-          ssnMatricula: ssn,
-          fiscalCondition: fiscal as (typeof organizations.$inferInsert)['fiscalCondition'],
-        })
+        .set(set)
         .where(eq(organizations.id, ctx.orgId))
         .returning({ id: organizations.id });
       await writeAuditLogTx(tx, {
@@ -2058,12 +2089,15 @@ v1.patch('/org', requireOwner, async (req, res, next) => {
 v1.delete('/account', requireOwner, async (req, res, next) => {
   const ctx = req.authCtx!;
   try {
-    const { db } = await import('../db/client.js');
-    await db.delete(organizations).where(eq(organizations.id, ctx.orgId));
-    await db.delete(schema.sessions).where(eq(schema.sessions.userId, ctx.userId));
-    await db.delete(schema.accounts).where(eq(schema.accounts.userId, ctx.userId));
-    await db.delete(schema.twoFactors).where(eq(schema.twoFactors.userId, ctx.userId));
-    await db.delete(users).where(eq(users.id, ctx.userId));
+    // Todo-o-nada: si un delete falla, revierte entero (sin org borrada con
+    // credenciales vivas ni estados a medias — la operación es irreversible).
+    await db.transaction(async (tx) => {
+      await tx.delete(organizations).where(eq(organizations.id, ctx.orgId));
+      await tx.delete(schema.sessions).where(eq(schema.sessions.userId, ctx.userId));
+      await tx.delete(schema.accounts).where(eq(schema.accounts.userId, ctx.userId));
+      await tx.delete(schema.twoFactors).where(eq(schema.twoFactors.userId, ctx.userId));
+      await tx.delete(users).where(eq(users.id, ctx.userId));
+    });
     res.json({ ok: true });
   } catch (err) { next(err); }
 });

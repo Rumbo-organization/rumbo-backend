@@ -76,7 +76,7 @@ interface DuePolicy {
   policyId: string; orgId: string; orgName: string;
   policyNumber: string | null; ramo: string; endDate: string;
   contactId: string; contactName: string; contactEmail: string | null;
-  producerName: string | null; producerEmail: string | null;
+  producerId: string | null; producerName: string | null; producerEmail: string | null;
   paymentMethod: string | null;
 }
 interface AgendaItem { id: string; title: string; time: string | null; kindLabel: string }
@@ -166,7 +166,7 @@ export async function runExpiryNotifications(opts: {
         paymentMethod: policies.paymentMethod,
         contactId: contacts.id, cKind: contacts.kind, cFirst: contacts.firstName,
         cLast: contacts.lastName, cLegal: contacts.legalName, contactMethods: contacts.contactMethods,
-        producerName: producers.name,
+        producerId: producers.id, producerName: producers.name,
       })
       .from(policies)
       .innerJoin(contacts, eq(contacts.id, policies.contactId))
@@ -190,7 +190,7 @@ export async function runExpiryNotifications(opts: {
         contactId: r.contactId,
         contactName: displayName({ kind: r.cKind, firstName: r.cFirst, lastName: r.cLast, legalName: r.cLegal }),
         contactEmail: primaryEmail(r.contactMethods),
-        producerName: r.producerName, producerEmail: null,
+        producerId: r.producerId, producerName: r.producerName, producerEmail: null,
         paymentMethod: r.paymentMethod,
       });
     }
@@ -223,10 +223,11 @@ export async function runExpiryNotifications(opts: {
     .from(producers)
     .innerJoin(users, eq(users.id, producers.userId))
     .where(inArray(producers.orgId, orgIds));
-  const producerEmail = new Map(producerRows.map((p) => [`${p.orgId}:${p.name}`, p.email]));
+  // Por id, no por nombre: dos productores homónimos (o un rename) misruteaban
+  // el digest con el match `${orgId}:${name}` anterior.
   const producerEmailById = new Map(producerRows.map((p) => [p.id, p.email]));
   for (const d of due) {
-    d.producerEmail = d.producerName ? (producerEmail.get(`${d.orgId}:${d.producerName}`) ?? null) : null;
+    d.producerEmail = d.producerId ? (producerEmailById.get(d.producerId) ?? null) : null;
   }
 
   // 3. Digest por casilla (productor lo suyo, organizador todo; dedup por póliza).

@@ -215,6 +215,9 @@ export const twoFactors = pgTable(
       .notNull()
       .references(() => users.id, { onDelete: "cascade" }),
     verified: boolean("verified").notNull().default(false),
+    // Better Auth 1.6: contador anti fuerza bruta del código TOTP (migración
+    // 0004). El monolito viejo (BA anterior) no la conoce; default 0.
+    failedVerificationCount: integer("failed_verification_count").notNull().default(0),
   },
   (table) => [index("two_factors_user_idx").on(table.userId)],
 );

@@ -1,11 +1,15 @@
 import { ALLOWED_ORIGINS, BETTER_AUTH_SECRET, IS_PROD } from './env.js';
 import { betterAuth } from 'better-auth';
+import { APIError } from 'better-auth/api';
 import { drizzleAdapter } from 'better-auth/adapters/drizzle';
 import { organization, twoFactor } from 'better-auth/plugins';
 import { eq } from 'drizzle-orm';
 
 import { db, schema } from './db/client.js';
 import { ensureUserOrg } from './onboarding.js';
+import { sendEmail } from './email.js';
+
+const APP_NAME = process.env.APP_NAME ?? 'Rumbo';
 
 // Better Auth (D-021) sobre las tablas snake_case de la app v0.1 (users,
 // sessions, accounts, organizations, members…) — las que ya tienen los datos
@@ -32,16 +36,46 @@ export const auth = betterAuth({
   secret: BETTER_AUTH_SECRET ?? 'dev-only-secret-cambiar',
   baseURL: process.env.BETTER_AUTH_URL ?? 'http://localhost:4000',
   trustedOrigins: ALLOWED_ORIGINS,
-  emailAndPassword: { enabled: true },
+  emailAndPassword: {
+    enabled: true,
+    // Se exige verificación recién con dominio + Resend en prod
+    // (REQUIRE_EMAIL_VERIFICATION=on). Slice 3 de paridad.
+    requireEmailVerification: process.env.REQUIRE_EMAIL_VERIFICATION === 'on',
+    sendResetPassword: async ({ user, url }) => {
+      await sendEmail({
+        to: user.email,
+        subject: `Restablecé tu contraseña de ${APP_NAME}`,
+        text: `Hola ${user.name},\n\nPara crear una contraseña nueva entrá acá:\n${url}\n\nSi no pediste este cambio, ignorá este email.\n\n${APP_NAME}`,
+      });
+    },
+  },
+
+  emailVerification: {
+    sendVerificationEmail: async ({ user, url }) => {
+      await sendEmail({
+        to: user.email,
+        subject: `Verificá tu email en ${APP_NAME}`,
+        text: `Hola ${user.name},\n\nConfirmá tu email entrando acá:\n${url}\n\n${APP_NAME}`,
+      });
+    },
+  },
 
   // A07 (OWASP): rate limiting anti fuerza bruta sobre los endpoints de auth
   // (login/signup/2fa). Storage en memoria por instancia (suficiente para
   // local/Docker; en serverless es por-instancia — endurecer con storage
-  // compartido si se escala).
+  // compartido si se escala). Ventanas más cortas en los endpoints sensibles
+  // (paridad con el monolito).
   rateLimit: {
     enabled: true,
     window: 60, // segundos
-    max: 30, // requests por IP por ventana
+    max: 60, // requests por IP por ventana
+    customRules: {
+      '/sign-in/email': { window: 60, max: 5 },
+      '/sign-up/email': { window: 60, max: 5 },
+      '/forget-password': { window: 60, max: 3 },
+      '/two-factor/verify-totp': { window: 60, max: 5 },
+      '/two-factor/verify-backup-code': { window: 60, max: 3 },
+    },
   },
   socialProviders:
     process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET
@@ -61,6 +95,27 @@ export const auth = betterAuth({
   },
 
   databaseHooks: {
+    user: {
+      create: {
+        // Gating de beta privada (paridad §4): con BETA_ALLOWLIST=on solo se
+        // registran emails anotados en la waitlist. El founder habilita gente
+        // insertándola ahí (script add-to-waitlist del monolito, misma DB).
+        before: async (user) => {
+          if (process.env.BETA_ALLOWLIST !== 'on') return;
+          const [hit] = await db
+            .select({ id: schema.waitlist.id })
+            .from(schema.waitlist)
+            .where(eq(schema.waitlist.email, user.email.toLowerCase()))
+            .limit(1);
+          if (!hit) {
+            throw new APIError('FORBIDDEN', {
+              code: 'BETA_NOT_ALLOWED',
+              message: 'Estamos en beta privada: el acceso es por invitación. Escribinos para coordinar tu acceso.',
+            });
+          }
+        },
+      },
+    },
     session: {
       create: {
         // Organizations-only (D-016.16.5): al crear la sesión, la org activa es

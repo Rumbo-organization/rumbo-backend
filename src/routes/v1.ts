@@ -887,6 +887,97 @@ v1.get('/policies/:id', async (req, res, next) => {
   }
 });
 
+// Detalle 360° de una póliza (para screen-detail): la póliza + resumen del
+// contacto + sus siniestros + actividad (eventos) + cross-sell. Consulta directa
+// (sin assembleCockpit → no capa). RLS: id ajeno → 404.
+v1.get('/policies/:id/detail', async (req, res, next) => {
+  const id = req.params.id;
+  if (!isUuidV1(id)) { res.status(400).json({ error: 'Id inválido.' }); return; }
+  try {
+    const out = await withAuthedTx(req.authCtx!, async (tx) => {
+      const [prow] = await tx
+        .select(policyRowSelect)
+        .from(policies)
+        .leftJoin(insurers, eq(insurers.id, policies.insurerId))
+        .leftJoin(contacts, eq(contacts.id, policies.contactId))
+        .where(eq(policies.id, id))
+        .limit(1);
+      if (!prow) return null;
+      const policy = mapPolicyRow(prow);
+
+      let contact = null;
+      if (policy.contactId) {
+        const [c] = await tx.select().from(contacts).where(eq(contacts.id, policy.contactId)).limit(1);
+        if (c) {
+          const name = displayName(c);
+          contact = {
+            id: c.id, name, initials: initialsOf(name),
+            kind: c.kind === 'PERSONA_JURIDICA' ? 'Empresa' : 'Persona',
+            since: String(c.createdAt.getFullYear()),
+            phone: firstPhone(c.contactMethods),
+            city: c.addressCity ?? '—',
+          };
+        }
+      }
+
+      const claimRowsP = await tx
+        .select({ cl: claims, stale: sql<number>`floor(extract(epoch from (now() - ${claims.lastActivityAt})) / 86400)::int` })
+        .from(claims)
+        .where(eq(claims.policyId, id))
+        .orderBy(desc(claims.lastActivityAt));
+      const siniestros = claimRowsP.map(({ cl, stale }) => ({
+        id: cl.id,
+        tipo: CLAIM_TIPO_LABEL[cl.tipo] ?? cl.tipo,
+        client: policy.client,
+        policyId: cl.policyId,
+        num: cl.claimNumber ?? '—',
+        status: CLAIM_STATUS_LABEL[cl.status] ?? cl.status,
+        importance: cl.importance ? CLAIM_IMPORTANCE_LABEL[cl.importance] ?? cl.importance : null,
+        reportedBy: cl.reportedBy,
+        stale: Math.max(0, stale),
+        opened: cl.occurredAt.toISOString().slice(0, 10),
+        insurer: policy.insurer,
+        ramo: policy.ramo,
+      }));
+
+      const evRows = await tx
+        .select({ e: claimEvents, authorName: users.name, claimNumber: claims.claimNumber })
+        .from(claimEvents)
+        .leftJoin(claims, eq(claims.id, claimEvents.claimId))
+        .leftJoin(users, eq(users.id, claimEvents.authorUserId))
+        .where(eq(claims.policyId, id))
+        .orderBy(desc(claimEvents.createdAt));
+      const now = new Date();
+      const activity = evRows.map(({ e, authorName, claimNumber }) => ({
+        when: relativeSince(e.createdAt, now),
+        who: authorName ?? 'Sistema',
+        text: e.kind === 'status_change'
+          ? `Siniestro ${claimNumber ?? ''} → ${CLAIM_STATUS_LABEL[e.newStatus ?? ''] ?? e.newStatus}`
+          : (e.body ?? 'Comentario'),
+        kind: e.kind === 'status_change' ? 'event' : 'note',
+      }));
+
+      const crosssell: object[] = [];
+      if (policy.contactId) {
+        const ramoRows = await tx.select({ ramo: policies.ramo }).from(policies).where(eq(policies.contactId, policy.contactId));
+        const ramos = new Set<string>(ramoRows.map((r) => r.ramo));
+        for (const rule of CROSS_RULES) {
+          if (ramos.has(rule.have) && !ramos.has(rule.lack)) {
+            crosssell.push({ id: `x-${policy.contactId}-${rule.suggest}`, client: policy.client, contactId: policy.contactId, has: [...ramos].map(ramoLabel), suggest: rule.suggest, reason: rule.reason, score: rule.score });
+            break;
+          }
+        }
+      }
+
+      return { policy, contact, siniestros, crosssell, activity };
+    });
+    if (!out) { res.status(404).json({ error: 'Póliza no encontrada' }); return; }
+    res.json(out);
+  } catch (err) {
+    next(err);
+  }
+});
+
 // Ficha 360° del asegurado (F-011 del legacy): datos propios del contacto +
 // derivados (pólizas, siniestros, cross-sell). RLS: un id que no sea de la
 // org/cartera de la sesión no devuelve fila → 404. Así la ficha SOLO expone

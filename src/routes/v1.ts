@@ -202,13 +202,6 @@ async function assembleCockpit(tx: AuthedTx, now: Date) {
     .from(producers)
     .orderBy(asc(producers.name));
 
-  const auditRows = await tx
-    .select({ a: auditLog, userName: users.name })
-    .from(auditLog)
-    .leftJoin(users, eq(users.id, auditLog.userId))
-    .orderBy(desc(auditLog.createdAt))
-    .limit(40);
-
   // ---- contactos (solo lookup interno: la array CONTACTS ya no viaja) ----
   const contactById = new Map(contactRows.map((c) => [c.id, c]));
 
@@ -299,29 +292,6 @@ async function assembleCockpit(tx: AuthedTx, now: Date) {
     }
   }
 
-  // ---- prospectos (contactos en pipeline) ----
-  const latestQuoteByContact = new Map<string, (typeof quoteRows)[number]['q']>();
-  for (const { q } of quoteRows) {
-    if (q.contactId && !latestQuoteByContact.has(q.contactId)) latestQuoteByContact.set(q.contactId, q);
-  }
-  const PROSPECTOS = contactRows
-    .filter((c) => c.status === 'prospecto')
-    .map((c) => {
-      const name = displayName(c);
-      const q = latestQuoteByContact.get(c.id);
-      return {
-        id: c.id,
-        name,
-        stage: c.pipelineStage ?? 'nuevo',
-        ramo: q ? ramoLabel(q.ramo) : '—',
-        city: c.addressCity ?? '—',
-        estim: 0,
-        since: relativeSince(c.updatedAt, now),
-        initials: initialsOf(name),
-        note: c.notes ?? '',
-      };
-    });
-
   // ---- cotizaciones ----
   const itemsByQuote = new Map<string, typeof quoteItemRows>();
   for (const it of quoteItemRows) {
@@ -363,20 +333,6 @@ async function assembleCockpit(tx: AuthedTx, now: Date) {
     conversion: 0,
     siniestros: siniestros ?? 0,
   }));
-
-  // ---- auditoría ----
-  const AUDIT = auditRows.map(({ a, userName }) => {
-    const payload = (a.payload ?? {}) as Record<string, unknown>;
-    return {
-      id: a.id,
-      when: relativeWhen(a.createdAt, now),
-      action: a.action,
-      entity: String(payload.entity ?? a.entityType ?? '—'),
-      detail: String(payload.detail ?? ''),
-      user: userName ?? 'Sistema',
-      kind: 'event',
-    };
-  });
 
   // ---- agregados del BOOK: SQL directo (uncapped), NO las arrays capadas ----
   // (Fase 3 escalabilidad: el dashboard debe contar toda la cartera, no las
@@ -444,10 +400,8 @@ async function assembleCockpit(tx: AuthedTx, now: Date) {
     CUOTAS,
     CROSSSELL,
     BOOK,
-    PROSPECTOS,
     COTIZACIONES,
     PRODUCTORES,
-    AUDIT,
   };
 }
 
@@ -479,6 +433,52 @@ v1.use(requireAuthedOrg);
 // Calendario (jul-2026): month view (4 fuentes derivadas) + CRUD de la agenda.
 // Primer camino de escritura del backend. Hereda requireAuthedOrg de este router.
 v1.use('/calendar', calendar);
+
+// Match de nombre del asegurado insensible a acentos: MISMA expresión que el
+// índice trigram de la migración 0005 del monolito viejo (la DB es compartida,
+// el índice ya existe). Paridad con search.global del viejo.
+const contactNameUnaccent = (term: string) =>
+  sql`f_unaccent(lower(coalesce(${contacts.firstName}, '') || ' ' || coalesce(${contacts.lastName}, '') || ' ' || coalesce(${contacts.legalName}, ''))) like f_unaccent(${'%' + term.toLowerCase() + '%'})`;
+
+// Picker liviano de siniestros (palette). Registrado ANTES del mount de
+// claimsRouter para que su GET /:id no capture "picker" como id.
+v1.get('/claims/picker', async (req, res, next) => {
+  const qStr = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+  const limit = Math.min(Math.max(parseInt(String(req.query.limit ?? '10'), 10) || 10, 1), 50);
+  try {
+    const out = await withAuthedTx(req.authCtx!, async (tx) => {
+      const conds = [];
+      if (qStr) {
+        conds.push(sql`(
+          ${claims.claimNumber} ilike ${'%' + qStr + '%'}
+          or ${policies.policyNumber} ilike ${'%' + qStr + '%'}
+          or ${contactNameUnaccent(qStr)}
+        )`);
+      }
+      const rows = await tx
+        .select({
+          c: claims,
+          cKind: contacts.kind, firstName: contacts.firstName, lastName: contacts.lastName, legalName: contacts.legalName,
+        })
+        .from(claims)
+        .leftJoin(policies, eq(policies.id, claims.policyId))
+        .leftJoin(contacts, eq(contacts.id, policies.contactId))
+        .where(conds.length ? and(...conds) : undefined)
+        .orderBy(desc(claims.lastActivityAt))
+        .limit(limit);
+      return {
+        data: rows.map(({ c, cKind, firstName, lastName, legalName }) => ({
+          id: c.id,
+          num: c.claimNumber ?? '—',
+          tipo: CLAIM_TIPO_LABEL[c.tipo] ?? c.tipo,
+          client: displayName({ kind: cKind ?? 'PERSONA_FISICA', firstName, lastName, legalName }),
+          status: CLAIM_STATUS_LABEL[c.status] ?? c.status,
+        })),
+      };
+    });
+    res.json(out);
+  } catch (err) { next(err); }
+});
 
 // Siniestros — escrituras (gestión). PATCH /claims/:id/status. La lectura de la
 // lista sigue en v1.get('/claims') (alias del cockpit) más abajo; este router no
@@ -649,17 +649,229 @@ v1.get('/vencimientos', async (req, res, next) => {
     res.json(out);
   } catch (err) { next(err); }
 });
-v1.get('/siniestros', section('SINIESTROS'));
+// Siniestros paginado server-side (Slice 2 de paridad): filtro por estado,
+// búsqueda (nº siniestro / nº póliza / titular sin acentos) y counts para los
+// chips. Misma forma de fila que SINIESTROS del bootstrap. RLS por org.
+const claimsList = async (req: import('express').Request, res: import('express').Response, next: import('express').NextFunction) => {
+  const qStr = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+  const estado = typeof req.query.estado === 'string' ? req.query.estado : 'todos';
+  const limit = Math.min(Math.max(parseInt(String(req.query.limit ?? '50'), 10) || 50, 1), 200);
+  const offset = Math.max(parseInt(String(req.query.offset ?? '0'), 10) || 0, 0);
+  try {
+    const out = await withAuthedTx(req.authCtx!, async (tx) => {
+      const conds = [];
+      if (estado === 'abiertos') conds.push(eq(claims.status, 'abierto'));
+      else if (estado === 'encurso') conds.push(eq(claims.status, 'en_curso'));
+      else if (estado === 'cerrados') conds.push(eq(claims.status, 'cerrado'));
+      if (qStr) {
+        conds.push(sql`(
+          ${claims.claimNumber} ilike ${'%' + qStr + '%'}
+          or ${policies.policyNumber} ilike ${'%' + qStr + '%'}
+          or ${contactNameUnaccent(qStr)}
+        )`);
+      }
+      const where = conds.length ? and(...conds) : undefined;
+      const base = () => tx
+        .select({
+          c: claims,
+          stale: sql<number>`floor(extract(epoch from (now() - ${claims.lastActivityAt})) / 86400)::int`,
+          policyNumber: policies.policyNumber,
+          insurerName: insurers.name,
+          ramo: policies.ramo,
+          cKind: contacts.kind, firstName: contacts.firstName, lastName: contacts.lastName, legalName: contacts.legalName,
+        })
+        .from(claims)
+        .leftJoin(policies, eq(policies.id, claims.policyId))
+        .leftJoin(insurers, eq(insurers.id, policies.insurerId))
+        .leftJoin(contacts, eq(contacts.id, policies.contactId));
+
+      const rows = await base().where(where).orderBy(desc(claims.lastActivityAt)).limit(limit).offset(offset);
+      const [agg] = await tx
+        .select({ n: sql<number>`count(*)::int` })
+        .from(claims)
+        .leftJoin(policies, eq(policies.id, claims.policyId))
+        .leftJoin(insurers, eq(insurers.id, policies.insurerId))
+        .leftJoin(contacts, eq(contacts.id, policies.contactId))
+        .where(where);
+      const [counts] = await tx
+        .select({
+          abiertos: sql<number>`count(*) filter (where ${claims.status} = 'abierto')::int`,
+          enCurso: sql<number>`count(*) filter (where ${claims.status} = 'en_curso')::int`,
+          cerrados: sql<number>`count(*) filter (where ${claims.status} = 'cerrado')::int`,
+          stale: sql<number>`count(*) filter (where ${claims.status} <> 'cerrado' and ${claims.lastActivityAt} < now() - interval '14 days')::int`,
+        })
+        .from(claims);
+
+      const data = rows.map(({ c, stale, policyNumber, insurerName, ramo, cKind, firstName, lastName, legalName }) => ({
+        id: c.id,
+        tipo: CLAIM_TIPO_LABEL[c.tipo] ?? c.tipo,
+        client: displayName({ kind: cKind ?? 'PERSONA_FISICA', firstName, lastName, legalName }),
+        policyId: c.policyId,
+        policyNum: policyNumber ?? '—',
+        num: c.claimNumber ?? '—',
+        status: CLAIM_STATUS_LABEL[c.status] ?? c.status,
+        importance: c.importance ? CLAIM_IMPORTANCE_LABEL[c.importance] ?? c.importance : null,
+        reportedBy: c.reportedBy,
+        stale: Math.max(0, stale),
+        opened: c.occurredAt.toISOString().slice(0, 10),
+        insurer: insurerName ?? '—',
+        ramo: ramo ? ramoLabel(ramo) : '—',
+      }));
+      return { data, total: agg?.n ?? 0, counts, limit, offset };
+    });
+    res.json(out);
+  } catch (err) { next(err); }
+};
+v1.get('/siniestros', claimsList);
 v1.get('/cuotas', section('CUOTAS'));
 v1.get('/crossselling', section('CROSSSELL'));
-v1.get('/prospectos', section('PROSPECTOS'));
+
+// Prospectos server-side (Slice 2): consulta directa uncapped (antes: array
+// del bootstrap capada por el LIMIT de contacts). Ramo = última cotización.
+v1.get('/prospectos', handle(async (tx) => {
+  const now = new Date();
+  const rows = await tx
+    .select({
+      c: contacts,
+      qRamo: sql<string | null>`(select q.ramo::text from ${quotes} q where q.contact_id = ${contacts.id} order by q.created_at desc limit 1)`,
+    })
+    .from(contacts)
+    .where(eq(contacts.status, 'prospecto'))
+    .orderBy(desc(contacts.updatedAt));
+  return {
+    data: rows.map(({ c, qRamo }) => {
+      const name = displayName(c);
+      return {
+        id: c.id,
+        name,
+        stage: c.pipelineStage ?? 'nuevo',
+        ramo: qRamo ? ramoLabel(qRamo) : '—',
+        city: c.addressCity ?? '—',
+        estim: 0,
+        since: relativeSince(c.updatedAt, now),
+        initials: initialsOf(name),
+        note: c.notes ?? '',
+      };
+    }),
+  };
+}));
+
+// Mover un prospecto en el pipeline (paridad contacts.advanceProspect):
+// etapa del kanban, o cierre ganado (→asegurado) / perdido (→exasegurado).
+const PROSPECT_STAGES = ['nuevo', 'contactado', 'cotizado', 'negociacion'];
+v1.patch('/contacts/:id/pipeline', async (req, res, next) => {
+  const id = req.params.id;
+  if (!isUuidV1(id)) { res.status(400).json({ error: 'Id inválido.' }); return; }
+  const to = String((req.body ?? {}).to ?? '');
+  if (!PROSPECT_STAGES.includes(to) && to !== 'ganado' && to !== 'perdido') {
+    res.status(400).json({ error: 'Movimiento inválido.' }); return;
+  }
+  const ctx = req.authCtx!;
+  try {
+    const out = await withAuthedTx(ctx, async (tx) => {
+      const patch =
+        to === 'ganado' ? { status: 'asegurado' as const, pipelineStage: null }
+        : to === 'perdido' ? { status: 'exasegurado' as const, pipelineStage: null }
+        : { pipelineStage: to as 'nuevo' | 'contactado' | 'cotizado' | 'negociacion' };
+      const [row] = await tx
+        .update(contacts)
+        .set({ ...patch, updatedAt: new Date() })
+        .where(and(eq(contacts.id, id), eq(contacts.status, 'prospecto')))
+        .returning({ id: contacts.id });
+      if (!row) return null;
+      await writeAuditLogTx(tx, {
+        orgId: ctx.orgId, userId: ctx.userId, action: 'advance_prospect', entityType: 'contact', entityId: row.id,
+        payload: { to },
+      });
+      return row;
+    });
+    if (!out) { res.status(404).json({ error: 'Prospecto no encontrado.' }); return; }
+    res.json({ ok: true });
+  } catch (err) { next(err); }
+});
+
+// Log de comunicaciones (paridad communications.log): el "marqué que envié"
+// del WhatsApp wa.me (no hay API de WhatsApp Business en v0.1).
+v1.post('/communications', async (req, res, next) => {
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const contactId = String(body.contactId ?? '');
+  if (!isUuidV1(contactId)) { res.status(400).json({ error: 'Asegurado inválido.' }); return; }
+  const policyId = body.policyId != null && body.policyId !== '' ? String(body.policyId) : null;
+  if (policyId !== null && !isUuidV1(policyId)) { res.status(400).json({ error: 'Póliza inválida.' }); return; }
+  const channel = ['whatsapp', 'email', 'llamada', 'otro'].includes(String(body.channel)) ? String(body.channel) : 'whatsapp';
+  const templateId = typeof body.templateId === 'string' ? body.templateId.trim().slice(0, 40) || null : null;
+  const bodyText = typeof body.body === 'string' ? body.body.trim().slice(0, 2000) || null : null;
+  const ctx = req.authCtx!;
+  try {
+    const out = await withAuthedTx(ctx, async (tx) => {
+      // El asegurado debe ser visible bajo RLS (las FK bypassean RLS).
+      const [contact] = await tx.select({ id: contacts.id }).from(contacts).where(eq(contacts.id, contactId)).limit(1);
+      if (!contact) return null;
+      const [row] = await tx
+        .insert(schema.communications)
+        .values({
+          orgId: ctx.orgId,
+          contactId,
+          policyId,
+          channel: channel as 'whatsapp' | 'email' | 'llamada' | 'otro',
+          templateId,
+          body: bodyText,
+          createdByUserId: ctx.userId,
+        })
+        .returning({ id: schema.communications.id });
+      await writeAuditLogTx(tx, {
+        orgId: ctx.orgId, userId: ctx.userId, action: 'log_communication', entityType: 'communication', entityId: row!.id,
+        payload: { channel, templateId },
+      });
+      return row;
+    });
+    if (!out) { res.status(404).json({ error: 'Asegurado no encontrado.' }); return; }
+    res.status(201).json({ id: out.id });
+  } catch (err) { next(err); }
+});
+
 v1.get('/cotizaciones', section('COTIZACIONES'));
 v1.get('/productores', requireOwner, section('PRODUCTORES'));
-v1.get('/actividad', section('AUDIT'));
+
+// Actividad (audit_log) paginada server-side (Slice 2): antes alias capado a 40.
+// El scoping productor-ve-lo-suyo / organizador-todo lo da la policy RLS de
+// audit_log. Misma forma de fila que AUDIT del bootstrap.
+v1.get('/actividad', async (req, res, next) => {
+  const limit = Math.min(Math.max(parseInt(String(req.query.limit ?? '50'), 10) || 50, 1), 200);
+  const offset = Math.max(parseInt(String(req.query.offset ?? '0'), 10) || 0, 0);
+  try {
+    const out = await withAuthedTx(req.authCtx!, async (tx) => {
+      const now = new Date();
+      const rows = await tx
+        .select({ a: auditLog, userName: users.name })
+        .from(auditLog)
+        .leftJoin(users, eq(users.id, auditLog.userId))
+        .orderBy(desc(auditLog.createdAt))
+        .limit(limit)
+        .offset(offset);
+      const [agg] = await tx.select({ n: sql<number>`count(*)::int` }).from(auditLog);
+      const data = rows.map(({ a, userName }) => {
+        const payload = (a.payload ?? {}) as Record<string, unknown>;
+        return {
+          id: a.id,
+          when: relativeWhen(a.createdAt, now),
+          action: a.action,
+          entity: String(payload.entity ?? a.entityType ?? '—'),
+          detail: String(payload.detail ?? ''),
+          user: userName ?? 'Sistema',
+          kind: 'event',
+        };
+      });
+      return { data, total: agg?.n ?? 0, limit, offset };
+    });
+    res.json(out);
+  } catch (err) { next(err); }
+});
+
 v1.get('/insurers', handle(async (tx) => ({ data: (await assembleCockpit(tx, new Date())).INSURERS })));
 
 // Alias en inglés (compatibilidad con la primera versión del cliente).
-v1.get('/claims', section('SINIESTROS'));
+v1.get('/claims', claimsList);
 v1.get('/quotes', section('COTIZACIONES'));
 
 // KPIs agregados del dashboard.
@@ -806,9 +1018,7 @@ v1.get('/policies/picker', async (req, res, next) => {
           ${policies.policyNumber} ilike ${like}
           or ${policies.ramo}::text ilike ${like}
           or ${insurers.name} ilike ${like}
-          or ${contacts.firstName} ilike ${like}
-          or ${contacts.lastName} ilike ${like}
-          or ${contacts.legalName} ilike ${like}
+          or ${contactNameUnaccent(qStr)}
         )`);
       }
       const rows = await tx
@@ -841,9 +1051,7 @@ v1.get('/contacts/picker', async (req, res, next) => {
       if (qStr) {
         const like = `%${qStr}%`;
         conds.push(sql`(
-          ${contacts.firstName} ilike ${like}
-          or ${contacts.lastName} ilike ${like}
-          or ${contacts.legalName} ilike ${like}
+          ${contactNameUnaccent(qStr)}
           or ${contacts.dni} ilike ${like}
           or ${contacts.cuit} ilike ${like}
           or ${contacts.addressCity} ilike ${like}
@@ -1171,6 +1379,24 @@ v1.get('/contacts/:id', async (req, res, next) => {
         : [];
       const primaAnual = polizas.reduce((a, p) => a + (Number(p.prima) || 0) * (FREQ_MULT[p.freq] ?? 1), 0);
 
+      // Log de comunicaciones del asegurado (paridad communications.byContact).
+      const now = new Date();
+      const commRows = await tx
+        .select({ m: schema.communications, who: users.name })
+        .from(schema.communications)
+        .leftJoin(users, eq(users.id, schema.communications.createdByUserId))
+        .where(eq(schema.communications.contactId, c.id))
+        .orderBy(desc(schema.communications.createdAt))
+        .limit(50);
+      const comunicaciones = commRows.map(({ m, who }) => ({
+        id: m.id,
+        channel: m.channel,
+        templateId: m.templateId,
+        body: m.body,
+        when: relativeSince(m.createdAt, now),
+        who: who ?? 'Sistema',
+      }));
+
       return {
         id: c.id,
         name,
@@ -1189,6 +1415,7 @@ v1.get('/contacts/:id', async (req, res, next) => {
         polizas,
         siniestros,
         crosssell,
+        comunicaciones,
         stats: { primaAnual, polizas: polizas.length, siniestros: siniestros.length },
         // Valores crudos para el formulario de edición (la vista de arriba usa
         // shapes de display: status con label, address concatenada, tipos de

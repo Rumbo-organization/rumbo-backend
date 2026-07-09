@@ -39,24 +39,38 @@ export async function requireAuthedOrg(
 
     // Membership del usuario en la org activa (o la primera si no hay activa).
     // Aporta el `role` que gobierna is_org_admin() en las policies RLS.
-    const memberQuery = db
+    const memberWhere = (orgFilter: string | null) =>
+      orgFilter
+        ? and(
+            eq(schema.members.userId, s.user.id),
+            eq(schema.members.organizationId, orgFilter),
+          )
+        : eq(schema.members.userId, s.user.id);
+    let [member] = await db
       .select({
         orgId: schema.members.organizationId,
         role: schema.members.role,
       })
       .from(schema.members)
-      .where(
-        activeOrg
-          ? and(
-              eq(schema.members.userId, s.user.id),
-              eq(schema.members.organizationId, activeOrg),
-            )
-          : eq(schema.members.userId, s.user.id),
-      )
+      .where(memberWhere(activeOrg))
       .limit(1);
-    const [member] = await memberQuery;
 
-    const orgId = member?.orgId ?? activeOrg;
+    // Sesión con una org donde YA no es miembro (lo eliminaron con la sesión
+    // viva): caer a su primera membership real. NUNCA usar activeOrg sin
+    // membership que lo respalde — ese fallback dejaba a un miembro expulsado
+    // leyendo datos org-wide de la org que lo echó hasta expirar la sesión.
+    if (!member && activeOrg) {
+      [member] = await db
+        .select({
+          orgId: schema.members.organizationId,
+          role: schema.members.role,
+        })
+        .from(schema.members)
+        .where(memberWhere(null))
+        .limit(1);
+    }
+
+    const orgId = member?.orgId ?? null;
     if (!orgId) {
       res.status(403).json({ error: 'Sin organización activa' });
       return;

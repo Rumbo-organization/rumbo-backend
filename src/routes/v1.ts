@@ -1086,7 +1086,11 @@ v1.get('/contacts/picker', async (req, res, next) => {
 // ── Slice 5: resumen agrupado + exports CSV (registrados ANTES de /:id) ──────
 
 const csvCell = (v: unknown): string => {
-  const s = v == null ? '' : String(v);
+  let s = v == null ? '' : String(v);
+  // Formula injection (Excel/Sheets): una celda que arranca con = + - @ o
+  // tab/CR se ejecuta como fórmula al abrir el CSV. El dato viene del usuario
+  // (nombres, observaciones) → neutralizar con apóstrofo.
+  if (/^[=+\-@\t\r]/.test(s)) s = `'${s}`;
   return /[",\n;]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 };
 const csvSend = (res: import('express').Response, filename: string, header: string[], rows: unknown[][]) => {

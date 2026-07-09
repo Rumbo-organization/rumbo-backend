@@ -8,6 +8,7 @@ import { eq } from 'drizzle-orm';
 import { db, schema } from './db/client.js';
 import { ensureUserOrg } from './onboarding.js';
 import { sendEmail } from './email.js';
+import { isRedisConfigured, redisGet, redisSet } from './redis.js';
 
 const APP_NAME = process.env.APP_NAME ?? 'Rumbo';
 
@@ -61,14 +62,30 @@ export const auth = betterAuth({
   },
 
   // A07 (OWASP): rate limiting anti fuerza bruta sobre los endpoints de auth
-  // (login/signup/2fa). Storage en memoria por instancia (suficiente para
-  // local/Docker; en serverless es por-instancia — endurecer con storage
-  // compartido si se escala). Ventanas más cortas en los endpoints sensibles
-  // (paridad con el monolito).
+  // (login/signup/2fa). Con Upstash configurado el contador vive en Redis y
+  // el límite es GLOBAL entre instancias serverless (sin él, en memoria por
+  // instancia el límite real era 5×N y cada cold start lo reseteaba).
+  // customStorage y NO secondaryStorage: secondaryStorage además mueve el
+  // almacenamiento de sesiones a Redis — acá solo queremos el rate limit.
+  // Ventanas más cortas en los endpoints sensibles (paridad con el monolito).
   rateLimit: {
     enabled: true,
     window: 60, // segundos
     max: 60, // requests por IP por ventana
+    ...(isRedisConfigured()
+      ? {
+          customStorage: {
+            get: async (key: string) => {
+              const raw = await redisGet(`ba:rl:${key}`);
+              return raw ? JSON.parse(raw) : undefined;
+            },
+            set: async (key: string, value: unknown) => {
+              // TTL 2× la ventana más larga (60s): la key muere sola.
+              await redisSet(`ba:rl:${key}`, JSON.stringify(value), 120);
+            },
+          },
+        }
+      : {}),
     customRules: {
       '/sign-in/email': { window: 60, max: 5 },
       '/sign-up/email': { window: 60, max: 5 },

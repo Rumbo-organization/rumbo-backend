@@ -529,7 +529,7 @@ const section = (key: string) =>
 
 // Asegurados/contactos paginado server-side (Fase 2 escalabilidad,
 // roadmap/PLAN-ESCALABILIDAD.md): búsqueda (nombre/DNI/CUIT/ciudad), filtro por
-// segmento (asegurado/prospecto/empresa), orden y paginación en SQL. Devuelve
+// segmento (asegurado/prospecto/exasegurado/empresa), orden y paginación en SQL. Devuelve
 // solo datos del contacto (las pólizas se ven en el detalle). El resumen/ficha
 // se pide aparte por /contacts/:id. RLS por org.
 v1.get('/contacts', async (req, res, next) => {
@@ -555,6 +555,7 @@ v1.get('/contacts', async (req, res, next) => {
       }
       if (seg === 'clientes') conds.push(eq(contacts.status, 'asegurado'));
       else if (seg === 'prospectos') conds.push(eq(contacts.status, 'prospecto'));
+      else if (seg === 'exasegurados') conds.push(eq(contacts.status, 'exasegurado'));
       else if (seg === 'empresas') conds.push(eq(contacts.kind, 'PERSONA_JURIDICA'));
       const where = conds.length ? and(...conds) : undefined;
 

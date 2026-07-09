@@ -529,9 +529,9 @@ const section = (key: string) =>
 
 // Asegurados/contactos paginado server-side (Fase 2 escalabilidad,
 // roadmap/PLAN-ESCALABILIDAD.md): búsqueda (nombre/DNI/CUIT/ciudad), filtro por
-// segmento (asegurado/prospecto/empresa), orden y paginación en SQL. Agrega por
-// contacto el nº de pólizas y los días al próximo vencimiento (para la lista). El
-// resumen/ficha se pide aparte por /contacts/:id. RLS por org.
+// segmento (asegurado/prospecto/empresa), orden y paginación en SQL. Devuelve
+// solo datos del contacto (las pólizas se ven en el detalle). El resumen/ficha
+// se pide aparte por /contacts/:id. RLS por org.
 v1.get('/contacts', async (req, res, next) => {
   const qStr = typeof req.query.q === 'string' ? req.query.q.trim() : '';
   const seg = typeof req.query.seg === 'string' ? req.query.seg : 'todos';
@@ -561,11 +561,7 @@ v1.get('/contacts', async (req, res, next) => {
       const orderExpr = sql`coalesce(${contacts.legalName}, ${contacts.lastName}, ${contacts.firstName})`;
 
       const rows = await tx
-        .select({
-          c: contacts,
-          polCount: sql<number>`(select count(*)::int from ${policies} p where p.contact_id = ${contacts.id})`,
-          nextRenewDays: sql<number | null>`(select min(p.end_date - current_date)::int from ${policies} p where p.contact_id = ${contacts.id} and p.end_date is not null)`,
-        })
+        .select({ c: contacts })
         .from(contacts)
         .where(where)
         .orderBy(dir === 'desc' ? desc(orderExpr) : asc(orderExpr))
@@ -574,7 +570,7 @@ v1.get('/contacts', async (req, res, next) => {
 
       const total = (await tx.select({ n: sql<number>`count(*)::int` }).from(contacts).where(where))[0]?.n ?? 0;
 
-      const data = rows.map(({ c, polCount, nextRenewDays }) => {
+      const data = rows.map(({ c }) => {
         const name = displayName(c);
         return {
           id: c.id,
@@ -586,8 +582,6 @@ v1.get('/contacts', async (req, res, next) => {
           document: c.dni ? `DNI ${c.dni}` : c.cuit ? `CUIT ${c.cuit}` : null,
           since: String(c.createdAt.getFullYear()),
           tags: c.status === 'prospecto' ? ['Prospecto'] : c.status === 'exasegurado' ? ['Ex asegurado'] : ['Asegurado'],
-          polCount: polCount ?? 0,
-          nextRenewDays: nextRenewDays,
         };
       });
       return { data, total, limit, offset };

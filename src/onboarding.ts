@@ -40,7 +40,7 @@ export async function ensureUserOrg(userId: string): Promise<string> {
 
   // org + membership + productor en una sola transacción: si algo falla no queda
   // una organización huérfana ni una membership sin su productor.
-  return db.transaction(async (tx) => {
+  return db.transaction(async tx => {
     const [org] = await tx
       .insert(schema.organizations)
       .values({ name: displayName, slug })

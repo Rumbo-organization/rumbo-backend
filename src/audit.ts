@@ -18,10 +18,7 @@ export interface WriteAuditLogInput {
   payload?: Record<string, unknown>;
 }
 
-export async function writeAuditLogTx(
-  tx: AuthedTx,
-  input: WriteAuditLogInput,
-): Promise<void> {
+export async function writeAuditLogTx(tx: AuthedTx, input: WriteAuditLogInput): Promise<void> {
   await tx.insert(schema.auditLog).values({
     orgId: input.orgId,
     userId: input.userId,

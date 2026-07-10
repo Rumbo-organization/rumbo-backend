@@ -7,7 +7,7 @@
 // directa del browser) → no hace falta CORS en el bucket. Los PDFs de póliza son
 // chicos; el límite de body de la función serverless alcanza.
 
-import { sha256Hex, signS3Request } from "./lib/sigv4.js";
+import { sha256Hex, signS3Request } from './lib/sigv4.js';
 
 interface R2Config {
   accountId: string;
@@ -31,9 +31,7 @@ function r2Config(): R2Config {
   const secretAccessKey = process.env.R2_SECRET_ACCESS_KEY;
   const bucket = process.env.R2_BUCKET;
   if (!accountId || !accessKeyId || !secretAccessKey || !bucket) {
-    throw new Error(
-      "R2 no configurado: faltan R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY y/o R2_BUCKET.",
-    );
+    throw new Error('R2 no configurado: faltan R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY y/o R2_BUCKET.');
   }
   return { accountId, accessKeyId, secretAccessKey, bucket };
 }
@@ -52,20 +50,20 @@ async function r2Fetch(
   const host = `${cfg.accountId}.r2.cloudflarestorage.com`;
   const url = `https://${host}/${cfg.bucket}/${key}`;
   const body = opts?.body;
-  const payloadHash = body ? await sha256Hex(body) : await sha256Hex("");
+  const payloadHash = body ? await sha256Hex(body) : await sha256Hex('');
 
   // Solo firmamos host (+ content-type en PUT); el resto van sin firmar. R2 usa
   // region "auto".
   const headersToSign: Record<string, string> = { host };
-  if (opts?.contentType) headersToSign["content-type"] = opts.contentType;
+  if (opts?.contentType) headersToSign['content-type'] = opts.contentType;
 
   const { headers } = await signS3Request({
     method,
     url,
     headers: headersToSign,
     payloadHash,
-    region: "auto",
-    service: "s3",
+    region: 'auto',
+    service: 's3',
     accessKeyId: cfg.accessKeyId,
     secretAccessKey: cfg.secretAccessKey,
   });
@@ -77,12 +75,8 @@ async function r2Fetch(
   });
 }
 
-export async function putObject(
-  key: string,
-  body: Uint8Array,
-  contentType: string,
-): Promise<void> {
-  const res = await r2Fetch("PUT", key, { body, contentType });
+export async function putObject(key: string, body: Uint8Array, contentType: string): Promise<void> {
+  const res = await r2Fetch('PUT', key, { body, contentType });
   if (!res.ok) {
     throw new Error(`R2 put falló (${res.status})`);
   }
@@ -90,7 +84,7 @@ export async function putObject(
 
 // Devuelve la Response cruda de R2 para que el route handler stree el body.
 export async function getObject(key: string): Promise<Response> {
-  const res = await r2Fetch("GET", key);
+  const res = await r2Fetch('GET', key);
   if (!res.ok) {
     throw new Error(`R2 get falló (${res.status})`);
   }
@@ -98,7 +92,7 @@ export async function getObject(key: string): Promise<Response> {
 }
 
 export async function deleteObject(key: string): Promise<void> {
-  const res = await r2Fetch("DELETE", key);
+  const res = await r2Fetch('DELETE', key);
   // 404 = ya no estaba; lo tratamos como éxito (idempotente).
   if (!res.ok && res.status !== 404) {
     throw new Error(`R2 delete falló (${res.status})`);

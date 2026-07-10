@@ -50,7 +50,7 @@ const RAMO_LABEL: Record<string, string> = {
   embarcaciones: 'Integral',
   otros: 'Integral',
 };
-const ramoLabel = (r: string | null): string => (r ? RAMO_LABEL[r] ?? 'Integral' : 'Integral');
+const ramoLabel = (r: string | null): string => (r ? (RAMO_LABEL[r] ?? 'Integral') : 'Integral');
 
 const CLAIM_TIPO_LABEL: Record<string, string> = {
   robo: 'Robo',
@@ -82,28 +82,52 @@ const PAYMENT_METHOD_LABEL: Record<string, string> = {
 };
 
 const ENDORSEMENT_TYPE_LABEL: Record<string, string> = {
-  emision: 'Emisión', refacturacion: 'Refacturación', endoso: 'Endoso', anulacion: 'Anulación',
+  emision: 'Emisión',
+  refacturacion: 'Refacturación',
+  endoso: 'Endoso',
+  anulacion: 'Anulación',
 };
 const PARTY_ROLE_LABEL: Record<string, string> = {
-  asegurado: 'Asegurado', tomador: 'Tomador', beneficiario: 'Beneficiario',
-  conductor: 'Conductor', acreedor_prendario: 'Acreedor prendario', otro: 'Otro',
+  asegurado: 'Asegurado',
+  tomador: 'Tomador',
+  beneficiario: 'Beneficiario',
+  conductor: 'Conductor',
+  acreedor_prendario: 'Acreedor prendario',
+  otro: 'Otro',
 };
 const RELATION_TYPE_LABEL: Record<string, string> = {
-  conyuge: 'Cónyuge', conviviente: 'Conviviente', hijo: 'Hijo/a', padre_madre: 'Padre/Madre',
-  hermano: 'Hermano/a', socio: 'Socio/a', empleado: 'Empleado/a', empleador: 'Empleador/a',
-  familiar: 'Familiar', otro: 'Otro',
+  conyuge: 'Cónyuge',
+  conviviente: 'Conviviente',
+  hijo: 'Hijo/a',
+  padre_madre: 'Padre/Madre',
+  hermano: 'Hermano/a',
+  socio: 'Socio/a',
+  empleado: 'Empleado/a',
+  empleador: 'Empleador/a',
+  familiar: 'Familiar',
+  otro: 'Otro',
 };
 // El inverso de cada relación (se guarda UNA fila dirigida; al leer desde el
 // otro lado se deriva). Igual al CONTACT_RELATION_INVERSE del viejo.
 const RELATION_INVERSE: Record<string, string> = {
-  conyuge: 'conyuge', conviviente: 'conviviente', hijo: 'padre_madre', padre_madre: 'hijo',
-  hermano: 'hermano', socio: 'socio', empleado: 'empleador', empleador: 'empleado',
-  familiar: 'familiar', otro: 'otro',
+  conyuge: 'conyuge',
+  conviviente: 'conviviente',
+  hijo: 'padre_madre',
+  padre_madre: 'hijo',
+  hermano: 'hermano',
+  socio: 'socio',
+  empleado: 'empleador',
+  empleador: 'empleado',
+  familiar: 'familiar',
+  otro: 'otro',
 };
 const ASSIGNEE_ROLE_LABEL: Record<string, string> = {
-  responsable: 'Responsable', comercial: 'Comercial', cobranzas: 'Cobranzas', siniestros: 'Siniestros',
+  responsable: 'Responsable',
+  comercial: 'Comercial',
+  cobranzas: 'Cobranzas',
+  siniestros: 'Siniestros',
 };
-const paymentLabel = (m: string | null): string | null => (m ? PAYMENT_METHOD_LABEL[m] ?? m : null);
+const paymentLabel = (m: string | null): string | null => (m ? (PAYMENT_METHOD_LABEL[m] ?? m) : null);
 
 const POLICY_STATUS_LABEL: Record<string, string> = {
   propuesta: 'Propuesta',
@@ -132,8 +156,8 @@ function initialsOf(name: string): string {
 function firstPhone(methods: unknown): string {
   if (!Array.isArray(methods)) return '';
   const m =
-    (methods as { type?: string; value?: string; primary?: boolean }[]).find((x) => x.primary) ??
-    (methods as { type?: string; value?: string }[]).find((x) =>
+    (methods as { type?: string; value?: string; primary?: boolean }[]).find(x => x.primary) ??
+    (methods as { type?: string; value?: string }[]).find(x =>
       ['celular', 'telefono', 'whatsapp'].includes(x.type ?? ''),
     );
   return m?.value ?? '';
@@ -142,7 +166,12 @@ function firstPhone(methods: unknown): string {
 const MONTHS_AR = ['ene', 'feb', 'mar', 'abr', 'may', 'jun', 'jul', 'ago', 'sep', 'oct', 'nov', 'dic'];
 
 function relativeWhen(d: Date, now: Date): string {
-  const hm = d.toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'America/Argentina/Cordoba' });
+  const hm = d.toLocaleTimeString('es-AR', {
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+    timeZone: 'America/Argentina/Cordoba',
+  });
   const day = (x: Date) => x.toLocaleDateString('en-CA', { timeZone: 'America/Argentina/Cordoba' });
   const dayDiff = Math.round((Date.parse(day(now)) - Date.parse(day(d))) / 86400000);
   if (dayDiff <= 0) return `Hoy ${hm}`;
@@ -172,14 +201,10 @@ const num = (x: unknown): number => (x == null ? 0 : Number(x));
 
 async function assembleCockpit(tx: AuthedTx, now: Date) {
   // La tx usa una sola conexión: queries secuenciales, no Promise.all.
-  const contactRows = await tx
-    .select()
-    .from(contacts)
-    .orderBy(asc(contacts.createdAt))
-    .limit(500);
+  const contactRows = await tx.select().from(contacts).orderBy(asc(contacts.createdAt)).limit(500);
 
   const insurerRows = await tx.select().from(insurers).orderBy(asc(insurers.name));
-  const insurerName = new Map(insurerRows.map((i) => [i.id, i.name]));
+  const insurerName = new Map(insurerRows.map(i => [i.id, i.name]));
 
   const policyRows = await tx
     .select({
@@ -225,7 +250,7 @@ async function assembleCockpit(tx: AuthedTx, now: Date) {
     .orderBy(asc(producers.name));
 
   // ---- contactos (solo lookup interno: la array CONTACTS ya no viaja) ----
-  const contactById = new Map(contactRows.map((c) => [c.id, c]));
+  const contactById = new Map(contactRows.map(c => [c.id, c]));
 
   // ---- pólizas ----
   const clientOf = (contactId: string | null): string => {
@@ -262,7 +287,7 @@ async function assembleCockpit(tx: AuthedTx, now: Date) {
       policyId: c.policyId,
       num: c.claimNumber ?? '—',
       status: CLAIM_STATUS_LABEL[c.status] ?? c.status,
-      importance: c.importance ? CLAIM_IMPORTANCE_LABEL[c.importance] ?? c.importance : null,
+      importance: c.importance ? (CLAIM_IMPORTANCE_LABEL[c.importance] ?? c.importance) : null,
       reportedBy: c.reportedBy,
       stale: Math.max(0, stale),
       opened: c.occurredAt.toISOString().slice(0, 10),
@@ -329,7 +354,8 @@ async function assembleCockpit(tx: AuthedTx, now: Date) {
   // ---- agregados del BOOK: SQL directo (uncapped), NO las arrays capadas ----
   // (Fase 3 escalabilidad: el dashboard debe contar toda la cartera, no las
   // primeras 1000/500 filas del bootstrap.) Bajo RLS = solo esta org.
-  const [polAgg] = (await tx.execute(sql`
+  const [polAgg] = (
+    await tx.execute(sql`
     select
       count(*)::int as total,
       count(*) filter (where status = 'vigente')::int as vigentes,
@@ -337,30 +363,45 @@ async function assembleCockpit(tx: AuthedTx, now: Date) {
       count(*) filter (where status = 'vigente' and end_date is not null and (end_date - current_date) <= 30)::int as vence30,
       count(*) filter (where status = 'vigente' and end_date is not null and (end_date - current_date) <= 7)::int as vence7
     from policies
-  `)).rows as unknown as Array<{ total: number; vigentes: number; prima_vigente: number; vence30: number; vence7: number }>;
+  `)
+  ).rows as unknown as Array<{
+    total: number;
+    vigentes: number;
+    prima_vigente: number;
+    vence30: number;
+    vence7: number;
+  }>;
 
-  const [primaAnualRow] = (await tx.execute(sql`
+  const [primaAnualRow] = (
+    await tx.execute(sql`
     select coalesce(sum(p.prima * (case when ic.n >= 10 then 12 when ic.n >= 4 then 4 when ic.n >= 2 then 2 else 1 end)), 0)::float8 as prima_anual
     from policies p
     left join (select policy_id, count(*)::int as n from policy_installments group by policy_id) ic on ic.policy_id = p.id
-  `)).rows as unknown as Array<{ prima_anual: number }>;
+  `)
+  ).rows as unknown as Array<{ prima_anual: number }>;
 
-  const [contactAgg] = (await tx.execute(sql`
+  const [contactAgg] = (
+    await tx.execute(sql`
     select count(*) filter (where status = 'asegurado')::int as asegurados from contacts
-  `)).rows as unknown as Array<{ asegurados: number }>;
+  `)
+  ).rows as unknown as Array<{ asegurados: number }>;
 
-  const [claimAgg] = (await tx.execute(sql`
+  const [claimAgg] = (
+    await tx.execute(sql`
     select
       count(*) filter (where status <> 'cerrado')::int as abiertos,
       count(*) filter (where status <> 'cerrado' and last_activity_at <= now() - interval '10 days')::int as stale
     from claims
-  `)).rows as unknown as Array<{ abiertos: number; stale: number }>;
+  `)
+  ).rows as unknown as Array<{ abiertos: number; stale: number }>;
 
-  const [cuotaAgg] = (await tx.execute(sql`
+  const [cuotaAgg] = (
+    await tx.execute(sql`
     select count(*)::int as vencidas, coalesce(sum(amount), 0)::float8 as monto
     from policy_installments
     where paid_at is null and due_date < current_date
-  `)).rows as unknown as Array<{ vencidas: number; monto: number }>;
+  `)
+  ).rows as unknown as Array<{ vencidas: number; monto: number }>;
 
   const health = Math.max(
     40,
@@ -386,7 +427,7 @@ async function assembleCockpit(tx: AuthedTx, now: Date) {
   // agregados y secciones chicas del dashboard.
   return {
     TODAY: now.toISOString().slice(0, 10),
-    INSURERS: insurerRows.map((i) => i.name),
+    INSURERS: insurerRows.map(i => i.name),
     VENCIMIENTOS,
     SINIESTROS,
     CUOTAS,
@@ -437,7 +478,7 @@ v1.get('/claims/picker', async (req, res, next) => {
   const qStr = typeof req.query.q === 'string' ? req.query.q.trim() : '';
   const limit = Math.min(Math.max(parseInt(String(req.query.limit ?? '10'), 10) || 10, 1), 50);
   try {
-    const out = await withAuthedTx(req.authCtx!, async (tx) => {
+    const out = await withAuthedTx(req.authCtx!, async tx => {
       const conds = [];
       if (qStr) {
         conds.push(sql`(
@@ -449,7 +490,10 @@ v1.get('/claims/picker', async (req, res, next) => {
       const rows = await tx
         .select({
           c: claims,
-          cKind: contacts.kind, firstName: contacts.firstName, lastName: contacts.lastName, legalName: contacts.legalName,
+          cKind: contacts.kind,
+          firstName: contacts.firstName,
+          lastName: contacts.lastName,
+          legalName: contacts.legalName,
         })
         .from(claims)
         .leftJoin(policies, eq(policies.id, claims.policyId))
@@ -468,7 +512,9 @@ v1.get('/claims/picker', async (req, res, next) => {
       };
     });
     res.json(out);
-  } catch (err) { next(err); }
+  } catch (err) {
+    next(err);
+  }
 });
 
 // Siniestros — escrituras (gestión). PATCH /claims/:id/status. La lectura de la
@@ -487,9 +533,13 @@ v1.use(quotesRouter);
 
 // Corre fn dentro de withAuthedTx y responde JSON; centraliza el try/catch.
 function handle<T>(fn: (tx: AuthedTx, ctx: NonNullable<import('../db/client.js').AuthContext>) => Promise<T>) {
-  return async (req: import('express').Request, res: import('express').Response, next: import('express').NextFunction) => {
+  return async (
+    req: import('express').Request,
+    res: import('express').Response,
+    next: import('express').NextFunction,
+  ) => {
     try {
-      const data = await withAuthedTx(req.authCtx!, (tx) => fn(tx, req.authCtx!));
+      const data = await withAuthedTx(req.authCtx!, tx => fn(tx, req.authCtx!));
       res.json(data);
     } catch (err) {
       next(err);
@@ -499,33 +549,38 @@ function handle<T>(fn: (tx: AuthedTx, ctx: NonNullable<import('../db/client.js')
 
 // BFF del cockpit: todo lo que la SPA necesita para hidratar window.RUMBO_DATA,
 // en un solo request (secciones + organización + usuario de la sesión).
-v1.get('/bootstrap', handle(async (tx, ctx) => {
-  const now = new Date();
-  const [cockpit, org] = [await assembleCockpit(tx, now), await loadOrg(tx)];
-  // termsAcceptedAt: gatea el modal de legales de única vez en el frontend
-  // (cuentas creadas antes del checkbox del registro). RLS self_isolation.
-  const [me] = await tx
-    .select({ termsAcceptedAt: users.termsAcceptedAt })
-    .from(users)
-    .where(eq(users.id, ctx.userId))
-    .limit(1);
-  return {
-    ...cockpit,
-    ORG: org,
-    ME: {
-      role: ctx.role,
-      roleLabel: ROLE_LABEL[ctx.role] ?? 'Productor',
-      producerId: ctx.producerId,
-      termsAcceptedAt: me?.termsAcceptedAt?.toISOString() ?? null,
-    },
-  };
-}));
+v1.get(
+  '/bootstrap',
+  handle(async (tx, ctx) => {
+    const now = new Date();
+    const [cockpit, org] = [await assembleCockpit(tx, now), await loadOrg(tx)];
+    // termsAcceptedAt: gatea el modal de legales de única vez en el frontend
+    // (cuentas creadas antes del checkbox del registro). RLS self_isolation.
+    const [me] = await tx
+      .select({ termsAcceptedAt: users.termsAcceptedAt })
+      .from(users)
+      .where(eq(users.id, ctx.userId))
+      .limit(1);
+    return {
+      ...cockpit,
+      ORG: org,
+      ME: {
+        role: ctx.role,
+        roleLabel: ROLE_LABEL[ctx.role] ?? 'Productor',
+        producerId: ctx.producerId,
+        termsAcceptedAt: me?.termsAcceptedAt?.toISOString() ?? null,
+      },
+    };
+  }),
+);
 
 // ── Endpoints REST individuales (misma forma que las arrays del cockpit) ──────
 // Base de la API pública (D-026). Cada uno devuelve { data: [...] }.
 
 const section = (key: string) =>
-  handle(async (tx) => ({ data: (await assembleCockpit(tx, new Date()))[key as keyof Awaited<ReturnType<typeof assembleCockpit>>] }));
+  handle(async tx => ({
+    data: (await assembleCockpit(tx, new Date()))[key as keyof Awaited<ReturnType<typeof assembleCockpit>>],
+  }));
 
 // Asegurados/contactos paginado server-side (Fase 2 escalabilidad,
 // roadmap/PLAN-ESCALABILIDAD.md): búsqueda (nombre/DNI/CUIT/ciudad), filtro por
@@ -540,7 +595,7 @@ v1.get('/contacts', async (req, res, next) => {
   const offset = Math.max(parseInt(String(req.query.offset ?? '0'), 10) || 0, 0);
 
   try {
-    const out = await withAuthedTx(req.authCtx!, async (tx) => {
+    const out = await withAuthedTx(req.authCtx!, async tx => {
       const conds = [];
       if (qStr) {
         const like = `%${qStr}%`;
@@ -569,7 +624,13 @@ v1.get('/contacts', async (req, res, next) => {
         .limit(limit)
         .offset(offset);
 
-      const total = (await tx.select({ n: sql<number>`count(*)::int` }).from(contacts).where(where))[0]?.n ?? 0;
+      const total =
+        (
+          await tx
+            .select({ n: sql<number>`count(*)::int` })
+            .from(contacts)
+            .where(where)
+        )[0]?.n ?? 0;
 
       const data = rows.map(({ c }) => {
         const name = displayName(c);
@@ -582,13 +643,16 @@ v1.get('/contacts', async (req, res, next) => {
           phone: firstPhone(c.contactMethods),
           document: c.dni ? `DNI ${c.dni}` : c.cuit ? `CUIT ${c.cuit}` : null,
           since: String(c.createdAt.getFullYear()),
-          tags: c.status === 'prospecto' ? ['Prospecto'] : c.status === 'exasegurado' ? ['Ex asegurado'] : ['Asegurado'],
+          tags:
+            c.status === 'prospecto' ? ['Prospecto'] : c.status === 'exasegurado' ? ['Ex asegurado'] : ['Asegurado'],
         };
       });
       return { data, total, limit, offset };
     });
     res.json(out);
-  } catch (err) { next(err); }
+  } catch (err) {
+    next(err);
+  }
 });
 // Vencimientos paginado server-side (Fase 4 escalabilidad): pólizas con fecha de
 // fin, ordenadas por renovación, filtradas por ventana (30/90/todo) y forma de
@@ -602,7 +666,7 @@ v1.get('/vencimientos', async (req, res, next) => {
   const offset = Math.max(parseInt(String(req.query.offset ?? '0'), 10) || 0, 0);
 
   try {
-    const out = await withAuthedTx(req.authCtx!, async (tx) => {
+    const out = await withAuthedTx(req.authCtx!, async tx => {
       const conds = [sql`${policies.endDate} is not null`];
       if (windowDays) conds.push(sql`(${policies.endDate} - current_date) <= ${windowDays}`);
       if (pay === '__none__') conds.push(sql`${policies.paymentMethod} is null`);
@@ -620,19 +684,26 @@ v1.get('/vencimientos', async (req, res, next) => {
         .limit(limit)
         .offset(offset);
 
-      const agg = (await tx
-        .select({ total: sql<number>`count(*)::int`, totalPrima: sql<number>`coalesce(sum(${policies.prima}), 0)::float8` })
-        .from(policies)
-        .where(where))[0];
+      const agg = (
+        await tx
+          .select({
+            total: sql<number>`count(*)::int`,
+            totalPrima: sql<number>`coalesce(sum(${policies.prima}), 0)::float8`,
+          })
+          .from(policies)
+          .where(where)
+      )[0];
 
       // Conteos por ventana (ignoran el filtro de pago, como los chips actuales).
-      const counts = (await tx.execute(sql`
+      const counts = (
+        await tx.execute(sql`
         select
           count(*) filter (where (end_date - current_date) <= 30)::int as d30,
           count(*) filter (where (end_date - current_date) <= 90)::int as d90,
           count(*)::int as all_count
         from policies where end_date is not null
-      `)).rows[0] as unknown as { d30: number; d90: number; all_count: number };
+      `)
+      ).rows[0] as unknown as { d30: number; d90: number; all_count: number };
 
       return {
         data: rows.map(mapPolicyRow),
@@ -644,18 +715,24 @@ v1.get('/vencimientos', async (req, res, next) => {
       };
     });
     res.json(out);
-  } catch (err) { next(err); }
+  } catch (err) {
+    next(err);
+  }
 });
 // Siniestros paginado server-side (Slice 2 de paridad): filtro por estado,
 // búsqueda (nº siniestro / nº póliza / titular sin acentos) y counts para los
 // chips. Misma forma de fila que SINIESTROS del bootstrap. RLS por org.
-const claimsList = async (req: import('express').Request, res: import('express').Response, next: import('express').NextFunction) => {
+const claimsList = async (
+  req: import('express').Request,
+  res: import('express').Response,
+  next: import('express').NextFunction,
+) => {
   const qStr = typeof req.query.q === 'string' ? req.query.q.trim() : '';
   const estado = typeof req.query.estado === 'string' ? req.query.estado : 'todos';
   const limit = Math.min(Math.max(parseInt(String(req.query.limit ?? '50'), 10) || 50, 1), 200);
   const offset = Math.max(parseInt(String(req.query.offset ?? '0'), 10) || 0, 0);
   try {
-    const out = await withAuthedTx(req.authCtx!, async (tx) => {
+    const out = await withAuthedTx(req.authCtx!, async tx => {
       const conds = [];
       if (estado === 'abiertos') conds.push(eq(claims.status, 'abierto'));
       else if (estado === 'encurso') conds.push(eq(claims.status, 'en_curso'));
@@ -668,19 +745,23 @@ const claimsList = async (req: import('express').Request, res: import('express')
         )`);
       }
       const where = conds.length ? and(...conds) : undefined;
-      const base = () => tx
-        .select({
-          c: claims,
-          stale: sql<number>`floor(extract(epoch from (now() - ${claims.lastActivityAt})) / 86400)::int`,
-          policyNumber: policies.policyNumber,
-          insurerName: insurers.name,
-          ramo: policies.ramo,
-          cKind: contacts.kind, firstName: contacts.firstName, lastName: contacts.lastName, legalName: contacts.legalName,
-        })
-        .from(claims)
-        .leftJoin(policies, eq(policies.id, claims.policyId))
-        .leftJoin(insurers, eq(insurers.id, policies.insurerId))
-        .leftJoin(contacts, eq(contacts.id, policies.contactId));
+      const base = () =>
+        tx
+          .select({
+            c: claims,
+            stale: sql<number>`floor(extract(epoch from (now() - ${claims.lastActivityAt})) / 86400)::int`,
+            policyNumber: policies.policyNumber,
+            insurerName: insurers.name,
+            ramo: policies.ramo,
+            cKind: contacts.kind,
+            firstName: contacts.firstName,
+            lastName: contacts.lastName,
+            legalName: contacts.legalName,
+          })
+          .from(claims)
+          .leftJoin(policies, eq(policies.id, claims.policyId))
+          .leftJoin(insurers, eq(insurers.id, policies.insurerId))
+          .leftJoin(contacts, eq(contacts.id, policies.contactId));
 
       const rows = await base().where(where).orderBy(desc(claims.lastActivityAt)).limit(limit).offset(offset);
       const [agg] = await tx
@@ -707,7 +788,7 @@ const claimsList = async (req: import('express').Request, res: import('express')
         policyNum: policyNumber ?? '—',
         num: c.claimNumber ?? '—',
         status: CLAIM_STATUS_LABEL[c.status] ?? c.status,
-        importance: c.importance ? CLAIM_IMPORTANCE_LABEL[c.importance] ?? c.importance : null,
+        importance: c.importance ? (CLAIM_IMPORTANCE_LABEL[c.importance] ?? c.importance) : null,
         reportedBy: c.reportedBy,
         stale: Math.max(0, stale),
         opened: c.occurredAt.toISOString().slice(0, 10),
@@ -717,7 +798,9 @@ const claimsList = async (req: import('express').Request, res: import('express')
       return { data, total: agg?.n ?? 0, counts, limit, offset };
     });
     res.json(out);
-  } catch (err) { next(err); }
+  } catch (err) {
+    next(err);
+  }
 };
 v1.get('/siniestros', claimsList);
 v1.get('/cuotas', section('CUOTAS'));
@@ -725,51 +808,62 @@ v1.get('/crossselling', section('CROSSSELL'));
 
 // Prospectos server-side (Slice 2): consulta directa uncapped (antes: array
 // del bootstrap capada por el LIMIT de contacts). Ramo = última cotización.
-v1.get('/prospectos', handle(async (tx) => {
-  const now = new Date();
-  const rows = await tx
-    .select({
-      c: contacts,
-      qRamo: sql<string | null>`(select q.ramo::text from ${quotes} q where q.contact_id = ${contacts.id} order by q.created_at desc limit 1)`,
-    })
-    .from(contacts)
-    .where(eq(contacts.status, 'prospecto'))
-    .orderBy(desc(contacts.updatedAt));
-  return {
-    data: rows.map(({ c, qRamo }) => {
-      const name = displayName(c);
-      return {
-        id: c.id,
-        name,
-        stage: c.pipelineStage ?? 'nuevo',
-        ramo: qRamo ? ramoLabel(qRamo) : '—',
-        city: c.addressCity ?? '—',
-        estim: 0,
-        since: relativeSince(c.updatedAt, now),
-        initials: initialsOf(name),
-        note: c.notes ?? '',
-      };
-    }),
-  };
-}));
+v1.get(
+  '/prospectos',
+  handle(async tx => {
+    const now = new Date();
+    const rows = await tx
+      .select({
+        c: contacts,
+        qRamo: sql<
+          string | null
+        >`(select q.ramo::text from ${quotes} q where q.contact_id = ${contacts.id} order by q.created_at desc limit 1)`,
+      })
+      .from(contacts)
+      .where(eq(contacts.status, 'prospecto'))
+      .orderBy(desc(contacts.updatedAt));
+    return {
+      data: rows.map(({ c, qRamo }) => {
+        const name = displayName(c);
+        return {
+          id: c.id,
+          name,
+          stage: c.pipelineStage ?? 'nuevo',
+          ramo: qRamo ? ramoLabel(qRamo) : '—',
+          city: c.addressCity ?? '—',
+          estim: 0,
+          since: relativeSince(c.updatedAt, now),
+          initials: initialsOf(name),
+          note: c.notes ?? '',
+        };
+      }),
+    };
+  }),
+);
 
 // Mover un prospecto en el pipeline (paridad contacts.advanceProspect):
 // etapa del kanban, o cierre ganado (→asegurado) / perdido (→exasegurado).
 const PROSPECT_STAGES = ['nuevo', 'contactado', 'cotizado', 'negociacion'];
 v1.patch('/contacts/:id/pipeline', async (req, res, next) => {
   const id = req.params.id;
-  if (!isUuidV1(id)) { res.status(400).json({ error: 'Id inválido.' }); return; }
+  if (!isUuidV1(id)) {
+    res.status(400).json({ error: 'Id inválido.' });
+    return;
+  }
   const to = String((req.body ?? {}).to ?? '');
   if (!PROSPECT_STAGES.includes(to) && to !== 'ganado' && to !== 'perdido') {
-    res.status(400).json({ error: 'Movimiento inválido.' }); return;
+    res.status(400).json({ error: 'Movimiento inválido.' });
+    return;
   }
   const ctx = req.authCtx!;
   try {
-    const out = await withAuthedTx(ctx, async (tx) => {
+    const out = await withAuthedTx(ctx, async tx => {
       const patch =
-        to === 'ganado' ? { status: 'asegurado' as const, pipelineStage: null }
-        : to === 'perdido' ? { status: 'exasegurado' as const, pipelineStage: null }
-        : { pipelineStage: to as 'nuevo' | 'contactado' | 'cotizado' | 'negociacion' };
+        to === 'ganado'
+          ? { status: 'asegurado' as const, pipelineStage: null }
+          : to === 'perdido'
+            ? { status: 'exasegurado' as const, pipelineStage: null }
+            : { pipelineStage: to as 'nuevo' | 'contactado' | 'cotizado' | 'negociacion' };
       const [row] = await tx
         .update(contacts)
         .set({ ...patch, updatedAt: new Date() })
@@ -777,14 +871,23 @@ v1.patch('/contacts/:id/pipeline', async (req, res, next) => {
         .returning({ id: contacts.id });
       if (!row) return null;
       await writeAuditLogTx(tx, {
-        orgId: ctx.orgId, userId: ctx.userId, action: 'advance_prospect', entityType: 'contact', entityId: row.id,
+        orgId: ctx.orgId,
+        userId: ctx.userId,
+        action: 'advance_prospect',
+        entityType: 'contact',
+        entityId: row.id,
         payload: { to },
       });
       return row;
     });
-    if (!out) { res.status(404).json({ error: 'Prospecto no encontrado.' }); return; }
+    if (!out) {
+      res.status(404).json({ error: 'Prospecto no encontrado.' });
+      return;
+    }
     res.json({ ok: true });
-  } catch (err) { next(err); }
+  } catch (err) {
+    next(err);
+  }
 });
 
 // Log de comunicaciones (paridad communications.log): el "marqué que envié"
@@ -792,15 +895,23 @@ v1.patch('/contacts/:id/pipeline', async (req, res, next) => {
 v1.post('/communications', async (req, res, next) => {
   const body = (req.body ?? {}) as Record<string, unknown>;
   const contactId = String(body.contactId ?? '');
-  if (!isUuidV1(contactId)) { res.status(400).json({ error: 'Asegurado inválido.' }); return; }
+  if (!isUuidV1(contactId)) {
+    res.status(400).json({ error: 'Asegurado inválido.' });
+    return;
+  }
   const policyId = body.policyId != null && body.policyId !== '' ? String(body.policyId) : null;
-  if (policyId !== null && !isUuidV1(policyId)) { res.status(400).json({ error: 'Póliza inválida.' }); return; }
-  const channel = ['whatsapp', 'email', 'llamada', 'otro'].includes(String(body.channel)) ? String(body.channel) : 'whatsapp';
+  if (policyId !== null && !isUuidV1(policyId)) {
+    res.status(400).json({ error: 'Póliza inválida.' });
+    return;
+  }
+  const channel = ['whatsapp', 'email', 'llamada', 'otro'].includes(String(body.channel))
+    ? String(body.channel)
+    : 'whatsapp';
   const templateId = typeof body.templateId === 'string' ? body.templateId.trim().slice(0, 40) || null : null;
   const bodyText = typeof body.body === 'string' ? body.body.trim().slice(0, 2000) || null : null;
   const ctx = req.authCtx!;
   try {
-    const out = await withAuthedTx(ctx, async (tx) => {
+    const out = await withAuthedTx(ctx, async tx => {
       // El asegurado debe ser visible bajo RLS (las FK bypassean RLS).
       const [contact] = await tx.select({ id: contacts.id }).from(contacts).where(eq(contacts.id, contactId)).limit(1);
       if (!contact) return null;
@@ -817,14 +928,23 @@ v1.post('/communications', async (req, res, next) => {
         })
         .returning({ id: schema.communications.id });
       await writeAuditLogTx(tx, {
-        orgId: ctx.orgId, userId: ctx.userId, action: 'log_communication', entityType: 'communication', entityId: row!.id,
+        orgId: ctx.orgId,
+        userId: ctx.userId,
+        action: 'log_communication',
+        entityType: 'communication',
+        entityId: row!.id,
         payload: { channel, templateId },
       });
       return row;
     });
-    if (!out) { res.status(404).json({ error: 'Asegurado no encontrado.' }); return; }
+    if (!out) {
+      res.status(404).json({ error: 'Asegurado no encontrado.' });
+      return;
+    }
     res.status(201).json({ id: out.id });
-  } catch (err) { next(err); }
+  } catch (err) {
+    next(err);
+  }
 });
 
 v1.get('/productores', requireOwner, section('PRODUCTORES'));
@@ -836,7 +956,7 @@ v1.get('/actividad', async (req, res, next) => {
   const limit = Math.min(Math.max(parseInt(String(req.query.limit ?? '50'), 10) || 50, 1), 200);
   const offset = Math.max(parseInt(String(req.query.offset ?? '0'), 10) || 0, 0);
   try {
-    const out = await withAuthedTx(req.authCtx!, async (tx) => {
+    const out = await withAuthedTx(req.authCtx!, async tx => {
       const now = new Date();
       const rows = await tx
         .select({ a: auditLog, userName: users.name })
@@ -861,19 +981,27 @@ v1.get('/actividad', async (req, res, next) => {
       return { data, total: agg?.n ?? 0, limit, offset };
     });
     res.json(out);
-  } catch (err) { next(err); }
+  } catch (err) {
+    next(err);
+  }
 });
 
 // Consulta directa: la lista de nombres no necesita rearmar el cockpit entero.
-v1.get('/insurers', handle(async (tx) => ({
-  data: (await tx.select({ name: insurers.name }).from(insurers).orderBy(asc(insurers.name))).map((i) => i.name),
-})));
+v1.get(
+  '/insurers',
+  handle(async tx => ({
+    data: (await tx.select({ name: insurers.name }).from(insurers).orderBy(asc(insurers.name))).map(i => i.name),
+  })),
+);
 
 // Alias en inglés (compatibilidad con la primera versión del cliente).
 v1.get('/claims', claimsList);
 
 // KPIs agregados del dashboard.
-v1.get('/book', handle(async (tx) => (await assembleCockpit(tx, new Date())).BOOK));
+v1.get(
+  '/book',
+  handle(async tx => (await assembleCockpit(tx, new Date())).BOOK),
+);
 
 // Pólizas paginado server-side (Fase 1 escalabilidad, roadmap/PLAN-ESCALABILIDAD.md):
 // búsqueda, filtro por segmento/forma de pago, orden y paginación en SQL. Misma
@@ -901,17 +1029,28 @@ const policyRowSelect = {
   lastName: contacts.lastName,
   legalName: contacts.legalName,
   instCount: sql<number>`(select count(*)::int from ${policyInstallments} pi where pi.policy_id = ${policies.id})`,
-  riskLabel: sql<string | null>`(select (r.descripcion || case when r.patente is not null then ' · ' || r.patente else '' end) from ${policyRisks} r where r.policy_id = ${policies.id} limit 1)`,
+  riskLabel: sql<
+    string | null
+  >`(select (r.descripcion || case when r.patente is not null then ' · ' || r.patente else '' end) from ${policyRisks} r where r.policy_id = ${policies.id} limit 1)`,
 };
 type PolicyRowRaw = {
   p: typeof policies.$inferSelect;
-  insurerName: string | null; cKind: string | null;
-  firstName: string | null; lastName: string | null; legalName: string | null;
-  instCount: number | null; riskLabel: string | null;
+  insurerName: string | null;
+  cKind: string | null;
+  firstName: string | null;
+  lastName: string | null;
+  legalName: string | null;
+  instCount: number | null;
+  riskLabel: string | null;
 };
 function mapPolicyRow(r: PolicyRowRaw) {
   const p = r.p;
-  const client = displayName({ kind: r.cKind ?? 'PERSONA_FISICA', firstName: r.firstName, lastName: r.lastName, legalName: r.legalName });
+  const client = displayName({
+    kind: r.cKind ?? 'PERSONA_FISICA',
+    firstName: r.firstName,
+    lastName: r.lastName,
+    legalName: r.legalName,
+  });
   return {
     id: p.id,
     num: p.policyNumber ?? '—',
@@ -934,11 +1073,35 @@ function mapPolicyRow(r: PolicyRowRaw) {
 // Reglas de cross-sell (ramo que tiene → ramo que le falta). Módulo-level para
 // reusarlas en el cockpit y en la ficha del contacto.
 const CROSS_RULES = [
-  { have: 'automotor', lack: 'hogar', suggest: 'Hogar', reason: 'Tiene Automotor, sin cobertura de vivienda', score: 'Alta' },
+  {
+    have: 'automotor',
+    lack: 'hogar',
+    suggest: 'Hogar',
+    reason: 'Tiene Automotor, sin cobertura de vivienda',
+    score: 'Alta',
+  },
   { have: 'automotor', lack: 'vida', suggest: 'Vida', reason: 'Tiene Automotor, sin seguro de vida', score: 'Media' },
-  { have: 'hogar', lack: 'automotor', suggest: 'Automotor', reason: 'Tiene Hogar, sin cobertura de vehículo', score: 'Media' },
-  { have: 'comercio', lack: 'automotor', suggest: 'Automotor', reason: 'Tiene Comercio, sin flota asegurada', score: 'Media' },
-  { have: 'art', lack: 'incendio', suggest: 'Integral', reason: 'Tiene ART, planta sin cobertura de incendio', score: 'Alta' },
+  {
+    have: 'hogar',
+    lack: 'automotor',
+    suggest: 'Automotor',
+    reason: 'Tiene Hogar, sin cobertura de vehículo',
+    score: 'Media',
+  },
+  {
+    have: 'comercio',
+    lack: 'automotor',
+    suggest: 'Automotor',
+    reason: 'Tiene Comercio, sin flota asegurada',
+    score: 'Media',
+  },
+  {
+    have: 'art',
+    lack: 'incendio',
+    suggest: 'Integral',
+    reason: 'Tiene ART, planta sin cobertura de incendio',
+    score: 'Alta',
+  },
 ];
 
 v1.get('/policies', async (req, res, next) => {
@@ -952,7 +1115,7 @@ v1.get('/policies', async (req, res, next) => {
   const offset = Math.max(parseInt(String(req.query.offset ?? '0'), 10) || 0, 0);
 
   try {
-    const out = await withAuthedTx(req.authCtx!, async (tx) => {
+    const out = await withAuthedTx(req.authCtx!, async tx => {
       const conds = [];
       if (qStr) {
         const like = `%${qStr}%`;
@@ -967,16 +1130,22 @@ v1.get('/policies', async (req, res, next) => {
         )`);
       }
       if (seg === 'porvencer') conds.push(sql`(${policies.endDate} - current_date) <= 30`);
-      else if (seg === 'siniestro') conds.push(sql`exists (select 1 from ${claims} cl where cl.policy_id = ${policies.id})`);
-      else if (seg === 'flota') conds.push(sql`(${policies.notes} ilike '%flota%' or exists (select 1 from ${policyRisks} r where r.policy_id = ${policies.id} and r.descripcion ilike '%flota%'))`);
+      else if (seg === 'siniestro')
+        conds.push(sql`exists (select 1 from ${claims} cl where cl.policy_id = ${policies.id})`);
+      else if (seg === 'flota')
+        conds.push(
+          sql`(${policies.notes} ilike '%flota%' or exists (select 1 from ${policyRisks} r where r.policy_id = ${policies.id} and r.descripcion ilike '%flota%'))`,
+        );
       if (producer) conds.push(eq(policies.producerId, producer));
       if (pay && PAYMENT_METHOD_LABEL[pay]) conds.push(sql`${policies.paymentMethod} = ${pay}`);
       const where = conds.length ? and(...conds) : undefined;
 
       const orderExpr =
-        sortKey === 'client' ? sql`coalesce(${contacts.legalName}, ${contacts.lastName}, ${contacts.firstName})`
-        : sortKey === 'insurer' ? insurers.name
-        : (POLICY_SORT_COL[sortKey] ?? policies.endDate);
+        sortKey === 'client'
+          ? sql`coalesce(${contacts.legalName}, ${contacts.lastName}, ${contacts.firstName})`
+          : sortKey === 'insurer'
+            ? insurers.name
+            : (POLICY_SORT_COL[sortKey] ?? policies.endDate);
 
       const rows = await tx
         .select(policyRowSelect)
@@ -989,18 +1158,23 @@ v1.get('/policies', async (req, res, next) => {
         .limit(limit)
         .offset(offset);
 
-      const total = (await tx
-        .select({ n: sql<number>`count(*)::int` })
-        .from(policies)
-        .leftJoin(insurers, eq(insurers.id, policies.insurerId))
-        .leftJoin(contacts, eq(contacts.id, policies.contactId))
-        .where(where))[0]?.n ?? 0;
+      const total =
+        (
+          await tx
+            .select({ n: sql<number>`count(*)::int` })
+            .from(policies)
+            .leftJoin(insurers, eq(insurers.id, policies.insurerId))
+            .leftJoin(contacts, eq(contacts.id, policies.contactId))
+            .where(where)
+        )[0]?.n ?? 0;
 
       const data = rows.map(mapPolicyRow);
       return { data, total, limit, offset };
     });
     res.json(out);
-  } catch (err) { next(err); }
+  } catch (err) {
+    next(err);
+  }
 });
 
 // Picker liviano de pólizas (Fase 3): filas mínimas para dropdowns/typeahead
@@ -1010,7 +1184,7 @@ v1.get('/policies/picker', async (req, res, next) => {
   const qStr = typeof req.query.q === 'string' ? req.query.q.trim() : '';
   const limit = Math.min(Math.max(parseInt(String(req.query.limit ?? '20'), 10) || 20, 1), 50);
   try {
-    const out = await withAuthedTx(req.authCtx!, async (tx) => {
+    const out = await withAuthedTx(req.authCtx!, async tx => {
       const conds = [];
       if (qStr) {
         const like = `%${qStr}%`;
@@ -1030,14 +1204,20 @@ v1.get('/policies/picker', async (req, res, next) => {
         .orderBy(desc(policies.endDate))
         .limit(limit);
       return {
-        data: rows.map(mapPolicyRow).map((p) => ({
-          id: p.id, num: p.num, client: p.client, ramo: p.ramo,
-          insurer: p.insurer, detail: p.detail,
+        data: rows.map(mapPolicyRow).map(p => ({
+          id: p.id,
+          num: p.num,
+          client: p.client,
+          ramo: p.ramo,
+          insurer: p.insurer,
+          detail: p.detail,
         })),
       };
     });
     res.json(out);
-  } catch (err) { next(err); }
+  } catch (err) {
+    next(err);
+  }
 });
 
 // Picker liviano de contactos (Fase 3): id + nombre para dropdowns/typeahead
@@ -1046,7 +1226,7 @@ v1.get('/contacts/picker', async (req, res, next) => {
   const qStr = typeof req.query.q === 'string' ? req.query.q.trim() : '';
   const limit = Math.min(Math.max(parseInt(String(req.query.limit ?? '20'), 10) || 20, 1), 50);
   try {
-    const out = await withAuthedTx(req.authCtx!, async (tx) => {
+    const out = await withAuthedTx(req.authCtx!, async tx => {
       const conds = [];
       if (qStr) {
         const like = `%${qStr}%`;
@@ -1064,10 +1244,12 @@ v1.get('/contacts/picker', async (req, res, next) => {
         .orderBy(asc(sql`coalesce(${contacts.legalName}, ${contacts.lastName}, ${contacts.firstName})`))
         .limit(limit);
       return {
-        data: rows.map((c) => {
+        data: rows.map(c => {
           const name = displayName(c);
           return {
-            id: c.id, name, initials: initialsOf(name),
+            id: c.id,
+            name,
+            initials: initialsOf(name),
             kind: c.kind === 'PERSONA_JURIDICA' ? 'Empresa' : 'Persona',
             city: c.addressCity ?? '—',
           };
@@ -1075,7 +1257,9 @@ v1.get('/contacts/picker', async (req, res, next) => {
       };
     });
     res.json(out);
-  } catch (err) { next(err); }
+  } catch (err) {
+    next(err);
+  }
 });
 
 // ── Slice 5: resumen agrupado + exports CSV (registrados ANTES de /:id) ──────
@@ -1089,7 +1273,7 @@ const csvCell = (v: unknown): string => {
   return /[",\n;]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 };
 const csvSend = (res: import('express').Response, filename: string, header: string[], rows: unknown[][]) => {
-  const body = [header, ...rows].map((r) => r.map(csvCell).join(';')).join('\r\n');
+  const body = [header, ...rows].map(r => r.map(csvCell).join(';')).join('\r\n');
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
   res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
   // BOM para que Excel AR abra UTF-8 con acentos bien.
@@ -1101,7 +1285,7 @@ const csvSend = (res: import('express').Response, filename: string, header: stri
 v1.get('/policies/summary', async (req, res, next) => {
   const by = req.query.by === 'estado' ? 'estado' : 'ramo';
   try {
-    const out = await withAuthedTx(req.authCtx!, async (tx) => {
+    const out = await withAuthedTx(req.authCtx!, async tx => {
       const col = by === 'estado' ? policies.status : policies.ramo;
       const rows = await tx
         .select({
@@ -1112,7 +1296,7 @@ v1.get('/policies/summary', async (req, res, next) => {
         .from(policies)
         .groupBy(sql`${col}`)
         .orderBy(sql`count(*) desc`);
-      const data = rows.map((r) => ({
+      const data = rows.map(r => ({
         key: r.key,
         label: by === 'estado' ? (POLICY_STATUS_LABEL[r.key] ?? r.key) : ramoLabel(r.key),
         count: r.count,
@@ -1121,42 +1305,73 @@ v1.get('/policies/summary', async (req, res, next) => {
       return { by, data };
     });
     res.json(out);
-  } catch (err) { next(err); }
+  } catch (err) {
+    next(err);
+  }
 });
 
 // Export CSV de pólizas (uncapped, bajo RLS — el productor exporta lo suyo).
 v1.get('/policies/export.csv', async (req, res, next) => {
   try {
-    const rows = await withAuthedTx(req.authCtx!, (tx) =>
-      tx.select(policyRowSelect)
+    const rows = await withAuthedTx(req.authCtx!, tx =>
+      tx
+        .select(policyRowSelect)
         .from(policies)
         .leftJoin(insurers, eq(insurers.id, policies.insurerId))
         .leftJoin(contacts, eq(contacts.id, policies.contactId))
         .orderBy(asc(policies.endDate)),
     );
     const data = rows.map(mapPolicyRow);
-    csvSend(res, 'polizas.csv',
+    csvSend(
+      res,
+      'polizas.csv',
       ['numero', 'asegurado', 'aseguradora', 'ramo', 'estado', 'inicio', 'fin', 'prima', 'forma_pago', 'observaciones'],
-      data.map((p) => [p.num, p.client, p.insurer, p.ramo, p.status, p.start, p.renew, p.prima, p.paymentMethod ?? '', p.coverage === '—' ? '' : p.coverage]));
-  } catch (err) { next(err); }
+      data.map(p => [
+        p.num,
+        p.client,
+        p.insurer,
+        p.ramo,
+        p.status,
+        p.start,
+        p.renew,
+        p.prima,
+        p.paymentMethod ?? '',
+        p.coverage === '—' ? '' : p.coverage,
+      ]),
+    );
+  } catch (err) {
+    next(err);
+  }
 });
 
 // Export CSV de asegurados.
 v1.get('/contacts/export.csv', async (req, res, next) => {
   try {
-    const rows = await withAuthedTx(req.authCtx!, (tx) =>
-      tx.select().from(contacts).orderBy(asc(sql`coalesce(${contacts.legalName}, ${contacts.lastName}, ${contacts.firstName})`)),
+    const rows = await withAuthedTx(req.authCtx!, tx =>
+      tx
+        .select()
+        .from(contacts)
+        .orderBy(asc(sql`coalesce(${contacts.legalName}, ${contacts.lastName}, ${contacts.firstName})`)),
     );
-    csvSend(res, 'asegurados.csv',
+    csvSend(
+      res,
+      'asegurados.csv',
       ['nombre', 'tipo', 'estado', 'dni', 'cuit', 'telefono', 'ciudad', 'provincia', 'observaciones'],
-      rows.map((c) => [
+      rows.map(c => [
         displayName(c),
         c.kind === 'PERSONA_JURIDICA' ? 'Empresa' : 'Persona',
         CONTACT_STATUS_LABEL[c.status] ?? c.status,
-        c.dni ?? '', c.cuit ?? '', firstPhone(c.contactMethods),
-        c.addressCity ?? '', c.addressProvince ?? '', c.notes ?? '',
-      ]));
-  } catch (err) { next(err); }
+        c.dni ?? '',
+        c.cuit ?? '',
+        firstPhone(c.contactMethods),
+        c.addressCity ?? '',
+        c.addressProvince ?? '',
+        c.notes ?? '',
+      ]),
+    );
+  } catch (err) {
+    next(err);
+  }
 });
 
 // Cross-selling server-side (Fase 3): oportunidades + mapa de cobertura sobre
@@ -1168,7 +1383,7 @@ v1.get('/crosssell', async (req, res, next) => {
   const limit = Math.min(Math.max(parseInt(String(req.query.limit ?? '50'), 10) || 50, 1), 200);
   const offset = Math.max(parseInt(String(req.query.offset ?? '0'), 10) || 0, 0);
   try {
-    const out = await withAuthedTx(req.authCtx!, async (tx) => {
+    const out = await withAuthedTx(req.authCtx!, async tx => {
       const rows = await tx
         .select({
           id: contacts.id,
@@ -1185,16 +1400,18 @@ v1.get('/crosssell', async (req, res, next) => {
         .groupBy(contacts.id)
         .orderBy(asc(sql`coalesce(${contacts.legalName}, ${contacts.lastName}, ${contacts.firstName})`));
 
-      const all = rows.map((r) => {
+      const all = rows.map(r => {
         const name = displayName(r);
         const ramos = new Set<string>(r.ramos ?? []);
-        const rule = CROSS_RULES.find((cr) => ramos.has(cr.have) && !ramos.has(cr.lack)) ?? null;
+        const rule = CROSS_RULES.find(cr => ramos.has(cr.have) && !ramos.has(cr.lack)) ?? null;
         return { r, name, ramos, rule };
       });
 
-      const opsAll = all.filter((x) => x.rule);
-      opsAll.sort((a, b) =>
-        ((b.rule!.score === 'Alta' ? 1 : 0) - (a.rule!.score === 'Alta' ? 1 : 0)) || a.name.localeCompare(b.name));
+      const opsAll = all.filter(x => x.rule);
+      opsAll.sort(
+        (a, b) =>
+          (b.rule!.score === 'Alta' ? 1 : 0) - (a.rule!.score === 'Alta' ? 1 : 0) || a.name.localeCompare(b.name),
+      );
       const ops = opsAll.slice(offset, offset + limit).map(({ r, name, ramos, rule }) => ({
         id: `x-${r.id}-${rule!.suggest}`,
         contactId: r.id,
@@ -1209,7 +1426,7 @@ v1.get('/crosssell', async (req, res, next) => {
       const bySuggest: Record<string, number> = {};
       for (const o of opsAll) bySuggest[o.rule!.suggest] = (bySuggest[o.rule!.suggest] ?? 0) + 1;
 
-      const matrix = [...opsAll, ...all.filter((x) => !x.rule)].slice(0, 40).map(({ r, name, ramos, rule }) => ({
+      const matrix = [...opsAll, ...all.filter(x => !x.rule)].slice(0, 40).map(({ r, name, ramos, rule }) => ({
         id: r.id,
         name,
         ramos: [...ramos].map(ramoLabel),
@@ -1217,22 +1434,31 @@ v1.get('/crosssell', async (req, res, next) => {
       }));
 
       return {
-        ops, total: opsAll.length, limit, offset,
-        counts: { altas: opsAll.filter((x) => x.rule!.score === 'Alta').length, bySuggest },
-        matrix, matrixTotal: all.length,
+        ops,
+        total: opsAll.length,
+        limit,
+        offset,
+        counts: { altas: opsAll.filter(x => x.rule!.score === 'Alta').length, bySuggest },
+        matrix,
+        matrixTotal: all.length,
       };
     });
     res.json(out);
-  } catch (err) { next(err); }
+  } catch (err) {
+    next(err);
+  }
 });
 
 // Póliza individual (misma forma que un item de POLICIES; 404 si no es de la org).
 // Consulta directa (sin assembleCockpit → no capa por LIMIT ni rearma el cockpit).
 v1.get('/policies/:id', async (req, res, next) => {
   const id = req.params.id;
-  if (!isUuidV1(id)) { res.status(400).json({ error: 'Id inválido.' }); return; }
+  if (!isUuidV1(id)) {
+    res.status(400).json({ error: 'Id inválido.' });
+    return;
+  }
   try {
-    const p = await withAuthedTx(req.authCtx!, async (tx) => {
+    const p = await withAuthedTx(req.authCtx!, async tx => {
       const [row] = await tx
         .select(policyRowSelect)
         .from(policies)
@@ -1257,9 +1483,12 @@ v1.get('/policies/:id', async (req, res, next) => {
 // (sin assembleCockpit → no capa). RLS: id ajeno → 404.
 v1.get('/policies/:id/detail', async (req, res, next) => {
   const id = req.params.id;
-  if (!isUuidV1(id)) { res.status(400).json({ error: 'Id inválido.' }); return; }
+  if (!isUuidV1(id)) {
+    res.status(400).json({ error: 'Id inválido.' });
+    return;
+  }
   try {
-    const out = await withAuthedTx(req.authCtx!, async (tx) => {
+    const out = await withAuthedTx(req.authCtx!, async tx => {
       const [prow] = await tx
         .select(policyRowSelect)
         .from(policies)
@@ -1276,7 +1505,9 @@ v1.get('/policies/:id/detail', async (req, res, next) => {
         if (c) {
           const name = displayName(c);
           contact = {
-            id: c.id, name, initials: initialsOf(name),
+            id: c.id,
+            name,
+            initials: initialsOf(name),
             kind: c.kind === 'PERSONA_JURIDICA' ? 'Empresa' : 'Persona',
             since: String(c.createdAt.getFullYear()),
             phone: firstPhone(c.contactMethods),
@@ -1286,7 +1517,10 @@ v1.get('/policies/:id/detail', async (req, res, next) => {
       }
 
       const claimRowsP = await tx
-        .select({ cl: claims, stale: sql<number>`floor(extract(epoch from (now() - ${claims.lastActivityAt})) / 86400)::int` })
+        .select({
+          cl: claims,
+          stale: sql<number>`floor(extract(epoch from (now() - ${claims.lastActivityAt})) / 86400)::int`,
+        })
         .from(claims)
         .where(eq(claims.policyId, id))
         .orderBy(desc(claims.lastActivityAt));
@@ -1297,7 +1531,7 @@ v1.get('/policies/:id/detail', async (req, res, next) => {
         policyId: cl.policyId,
         num: cl.claimNumber ?? '—',
         status: CLAIM_STATUS_LABEL[cl.status] ?? cl.status,
-        importance: cl.importance ? CLAIM_IMPORTANCE_LABEL[cl.importance] ?? cl.importance : null,
+        importance: cl.importance ? (CLAIM_IMPORTANCE_LABEL[cl.importance] ?? cl.importance) : null,
         reportedBy: cl.reportedBy,
         stale: Math.max(0, stale),
         opened: cl.occurredAt.toISOString().slice(0, 10),
@@ -1316,9 +1550,10 @@ v1.get('/policies/:id/detail', async (req, res, next) => {
       const activity = evRows.map(({ e, authorName, claimNumber }) => ({
         when: relativeSince(e.createdAt, now),
         who: authorName ?? 'Sistema',
-        text: e.kind === 'status_change'
-          ? `Siniestro ${claimNumber ?? ''} → ${CLAIM_STATUS_LABEL[e.newStatus ?? ''] ?? e.newStatus}`
-          : (e.body ?? 'Comentario'),
+        text:
+          e.kind === 'status_change'
+            ? `Siniestro ${claimNumber ?? ''} → ${CLAIM_STATUS_LABEL[e.newStatus ?? ''] ?? e.newStatus}`
+            : (e.body ?? 'Comentario'),
         kind: e.kind === 'status_change' ? 'event' : 'note',
       }));
 
@@ -1330,10 +1565,18 @@ v1.get('/policies/:id/detail', async (req, res, next) => {
           .select({ ramo: policies.ramo })
           .from(policies)
           .where(and(eq(policies.contactId, policy.contactId), eq(policies.status, 'vigente')));
-        const ramos = new Set<string>(ramoRows.map((r) => r.ramo));
+        const ramos = new Set<string>(ramoRows.map(r => r.ramo));
         for (const rule of CROSS_RULES) {
           if (ramos.has(rule.have) && !ramos.has(rule.lack)) {
-            crosssell.push({ id: `x-${policy.contactId}-${rule.suggest}`, client: policy.client, contactId: policy.contactId, has: [...ramos].map(ramoLabel), suggest: rule.suggest, reason: rule.reason, score: rule.score });
+            crosssell.push({
+              id: `x-${policy.contactId}-${rule.suggest}`,
+              client: policy.client,
+              contactId: policy.contactId,
+              has: [...ramos].map(ramoLabel),
+              suggest: rule.suggest,
+              reason: rule.reason,
+              score: rule.score,
+            });
             break;
           }
         }
@@ -1355,7 +1598,8 @@ v1.get('/policies/:id/detail', async (req, res, next) => {
         date: i.dueDate,
         amount: i.amount == null ? 0 : Number(i.amount),
         paid: i.paidAt != null,
-        status: i.paidAt != null ? 'Pagada' : daysFromDue > 0 ? 'Vencida' : daysFromDue >= -8 ? 'Por vencer' : 'Programada',
+        status:
+          i.paidAt != null ? 'Pagada' : daysFromDue > 0 ? 'Vencida' : daysFromDue >= -8 ? 'Por vencer' : 'Programada',
       }));
 
       // Slice 4: bien asegurado, endosos, personas y documentos de la póliza.
@@ -1364,8 +1608,10 @@ v1.get('/policies/:id/detail', async (req, res, next) => {
         .from(policyRisks)
         .where(eq(policyRisks.policyId, id))
         .orderBy(asc(policyRisks.createdAt));
-      const risks = riskRows.map((r) => ({
-        id: r.id, descripcion: r.descripcion, patente: r.patente ?? null,
+      const risks = riskRows.map(r => ({
+        id: r.id,
+        descripcion: r.descripcion,
+        patente: r.patente ?? null,
       }));
 
       const endosoRows = await tx
@@ -1373,21 +1619,38 @@ v1.get('/policies/:id/detail', async (req, res, next) => {
         .from(schema.policyEndorsements)
         .where(eq(schema.policyEndorsements.policyId, id))
         .orderBy(asc(schema.policyEndorsements.number));
-      const endosos = endosoRows.map((e) => ({
-        id: e.id, number: e.number, type: ENDORSEMENT_TYPE_LABEL[e.type] ?? e.type, typeRaw: e.type,
-        issuedAt: e.issuedAt, startDate: e.startDate, endDate: e.endDate,
-        prima: e.prima == null ? null : Number(e.prima), premio: e.premio == null ? null : Number(e.premio),
+      const endosos = endosoRows.map(e => ({
+        id: e.id,
+        number: e.number,
+        type: ENDORSEMENT_TYPE_LABEL[e.type] ?? e.type,
+        typeRaw: e.type,
+        issuedAt: e.issuedAt,
+        startDate: e.startDate,
+        endDate: e.endDate,
+        prima: e.prima == null ? null : Number(e.prima),
+        premio: e.premio == null ? null : Number(e.premio),
         description: e.description,
       }));
 
       const partyRows = await tx
-        .select({ pp: schema.policyParties, kind: contacts.kind, firstName: contacts.firstName, lastName: contacts.lastName, legalName: contacts.legalName, dni: contacts.dni, cuit: contacts.cuit })
+        .select({
+          pp: schema.policyParties,
+          kind: contacts.kind,
+          firstName: contacts.firstName,
+          lastName: contacts.lastName,
+          legalName: contacts.legalName,
+          dni: contacts.dni,
+          cuit: contacts.cuit,
+        })
         .from(schema.policyParties)
         .innerJoin(contacts, eq(contacts.id, schema.policyParties.contactId))
         .where(eq(schema.policyParties.policyId, id))
         .orderBy(asc(schema.policyParties.createdAt));
       const personas = partyRows.map(({ pp, kind, firstName, lastName, legalName, dni, cuit }) => ({
-        id: pp.id, contactId: pp.contactId, role: PARTY_ROLE_LABEL[pp.role] ?? pp.role, roleRaw: pp.role,
+        id: pp.id,
+        contactId: pp.contactId,
+        role: PARTY_ROLE_LABEL[pp.role] ?? pp.role,
+        roleRaw: pp.role,
         name: displayName({ kind, firstName, lastName, legalName }),
         document: dni ? `DNI ${dni}` : cuit ? `CUIT ${cuit}` : '—',
       }));
@@ -1397,13 +1660,19 @@ v1.get('/policies/:id/detail', async (req, res, next) => {
         .from(schema.documents)
         .where(eq(schema.documents.policyId, id))
         .orderBy(asc(schema.documents.createdAt));
-      const documentos = docRows.map((d) => ({
-        id: d.id, fileName: d.fileName, contentType: d.contentType, sizeBytes: d.sizeBytes,
+      const documentos = docRows.map(d => ({
+        id: d.id,
+        fileName: d.fileName,
+        contentType: d.contentType,
+        sizeBytes: d.sizeBytes,
       }));
 
       return { policy, contact, siniestros, crosssell, activity, installments, risks, endosos, personas, documentos };
     });
-    if (!out) { res.status(404).json({ error: 'Póliza no encontrada' }); return; }
+    if (!out) {
+      res.status(404).json({ error: 'Póliza no encontrada' });
+      return;
+    }
     res.json(out);
   } catch (err) {
     next(err);
@@ -1429,9 +1698,12 @@ const FREQ_MULT: Record<string, number> = { Mensual: 12, Trimestral: 4, Semestra
 
 v1.get('/contacts/:id', async (req, res, next) => {
   const id = req.params.id;
-  if (!isUuidV1(id)) { res.status(400).json({ error: 'Id inválido.' }); return; }
+  if (!isUuidV1(id)) {
+    res.status(400).json({ error: 'Id inválido.' });
+    return;
+  }
   try {
-    const data = await withAuthedTx(req.authCtx!, async (tx) => {
+    const data = await withAuthedTx(req.authCtx!, async tx => {
       const [c] = await tx.select().from(contacts).where(eq(contacts.id, id)).limit(1);
       if (!c) return null;
 
@@ -1447,7 +1719,7 @@ v1.get('/contacts/:id', async (req, res, next) => {
         .where(eq(policies.contactId, c.id))
         .orderBy(asc(policies.endDate));
       const polizas = polRows.map(mapPolicyRow);
-      const polIds = polizas.map((p) => p.id);
+      const polIds = polizas.map(p => p.id);
 
       // Siniestros de esas pólizas (misma forma que SINIESTROS del cockpit).
       const claimRows = polIds.length
@@ -1470,7 +1742,7 @@ v1.get('/contacts/:id', async (req, res, next) => {
         policyId: cl.policyId,
         num: cl.claimNumber ?? '—',
         status: CLAIM_STATUS_LABEL[cl.status] ?? cl.status,
-        importance: cl.importance ? CLAIM_IMPORTANCE_LABEL[cl.importance] ?? cl.importance : null,
+        importance: cl.importance ? (CLAIM_IMPORTANCE_LABEL[cl.importance] ?? cl.importance) : null,
         reportedBy: cl.reportedBy,
         stale: Math.max(0, stale),
         opened: cl.occurredAt.toISOString().slice(0, 10),
@@ -1478,7 +1750,7 @@ v1.get('/contacts/:id', async (req, res, next) => {
       }));
 
       // Cross-sell: reglas sobre los ramos (crudos) que tiene el contacto.
-      const ramos = new Set<string>(polRows.map((r) => r.p.ramo));
+      const ramos = new Set<string>(polRows.map(r => r.p.ramo));
       const crosssell: object[] = [];
       for (const rule of CROSS_RULES) {
         if (ramos.has(rule.have) && !ramos.has(rule.lack)) {
@@ -1504,8 +1776,8 @@ v1.get('/contacts/:id', async (req, res, next) => {
         .filter(Boolean)
         .join(', ');
       const methods = Array.isArray(c.contactMethods)
-        ? (c.contactMethods as Array<{ type?: string; value?: string; primary?: boolean }>).map((m) => ({
-            type: METHOD_TYPE_LABEL[m.type ?? ''] ?? (m.type ?? '—'),
+        ? (c.contactMethods as Array<{ type?: string; value?: string; primary?: boolean }>).map(m => ({
+            type: METHOD_TYPE_LABEL[m.type ?? ''] ?? m.type ?? '—',
             value: m.value ?? '',
             primary: Boolean(m.primary),
           }))
@@ -1517,14 +1789,14 @@ v1.get('/contacts/:id', async (req, res, next) => {
       const relRows = await tx
         .select()
         .from(schema.contactRelationships)
-        .where(sql`${schema.contactRelationships.contactId} = ${c.id} or ${schema.contactRelationships.relatedContactId} = ${c.id}`)
+        .where(
+          sql`${schema.contactRelationships.contactId} = ${c.id} or ${schema.contactRelationships.relatedContactId} = ${c.id}`,
+        )
         .orderBy(asc(schema.contactRelationships.createdAt));
-      const otherIds = [...new Set(relRows.map((r) => (r.contactId === c.id ? r.relatedContactId : r.contactId)))];
-      const otherRows = otherIds.length
-        ? await tx.select().from(contacts).where(inArray(contacts.id, otherIds))
-        : [];
-      const otherById = new Map(otherRows.map((o) => [o.id, o]));
-      const relaciones = relRows.map((r) => {
+      const otherIds = [...new Set(relRows.map(r => (r.contactId === c.id ? r.relatedContactId : r.contactId)))];
+      const otherRows = otherIds.length ? await tx.select().from(contacts).where(inArray(contacts.id, otherIds)) : [];
+      const otherById = new Map(otherRows.map(o => [o.id, o]));
+      const relaciones = relRows.map(r => {
         const forward = r.contactId === c.id;
         const otherId = forward ? r.relatedContactId : r.contactId;
         const other = otherById.get(otherId);
@@ -1543,14 +1815,18 @@ v1.get('/contacts/:id', async (req, res, next) => {
         .from(schema.contactAddresses)
         .where(eq(schema.contactAddresses.contactId, c.id))
         .orderBy(asc(schema.contactAddresses.createdAt));
-      const direcciones = dirRows.map((d) => ({
+      const direcciones = dirRows.map(d => ({
         id: d.id,
         label: d.label ?? 'Dirección',
         line: [
           [d.street, d.number].filter(Boolean).join(' '),
           [d.floor, d.apartment].filter(Boolean).join(' '),
-          d.city, d.province, d.postalCode,
-        ].filter(Boolean).join(', '),
+          d.city,
+          d.province,
+          d.postalCode,
+        ]
+          .filter(Boolean)
+          .join(', '),
       }));
 
       const asgRows = await tx
@@ -1560,7 +1836,11 @@ v1.get('/contacts/:id', async (req, res, next) => {
         .where(eq(schema.contactAssignees.contactId, c.id))
         .orderBy(asc(schema.contactAssignees.createdAt));
       const responsables = asgRows.map(({ a, userName, userEmail }) => ({
-        id: a.id, userId: a.userId, role: ASSIGNEE_ROLE_LABEL[a.role] ?? a.role, name: userName, email: userEmail,
+        id: a.id,
+        userId: a.userId,
+        role: ASSIGNEE_ROLE_LABEL[a.role] ?? a.role,
+        name: userName,
+        email: userEmail,
       }));
 
       const docRows = await tx
@@ -1568,8 +1848,11 @@ v1.get('/contacts/:id', async (req, res, next) => {
         .from(schema.documents)
         .where(eq(schema.documents.contactId, c.id))
         .orderBy(asc(schema.documents.createdAt));
-      const documentos = docRows.map((d) => ({
-        id: d.id, fileName: d.fileName, contentType: d.contentType, sizeBytes: d.sizeBytes,
+      const documentos = docRows.map(d => ({
+        id: d.id,
+        fileName: d.fileName,
+        contentType: d.contentType,
+        sizeBytes: d.sizeBytes,
       }));
 
       // Log de comunicaciones del asegurado (paridad communications.byContact).
@@ -1605,8 +1888,7 @@ v1.get('/contacts/:id', async (req, res, next) => {
         contactMethods: methods,
         // Calidad de datos 0-100 (tiers: <50 low, <80 medium, resto high).
         quality: c.dataQualityScore ?? 0,
-        tags:
-          c.status === 'prospecto' ? ['Prospecto'] : c.status === 'exasegurado' ? ['Ex asegurado'] : ['Asegurado'],
+        tags: c.status === 'prospecto' ? ['Prospecto'] : c.status === 'exasegurado' ? ['Ex asegurado'] : ['Asegurado'],
         polizas,
         siniestros,
         crosssell,
@@ -1655,9 +1937,13 @@ v1.get('/contacts/:id', async (req, res, next) => {
 // documento 30 + medio de contacto 30 + dirección (calle+localidad+provincia)
 // 25 + observaciones 15. Se recalcula en cada alta/edición.
 function qualityScoreOf(c: {
-  dni: string | null; cuit: string | null;
-  addressStreet: string | null; addressCity: string | null; addressProvince: string | null;
-  contactMethods: unknown; notes: string | null;
+  dni: string | null;
+  cuit: string | null;
+  addressStreet: string | null;
+  addressCity: string | null;
+  addressProvince: string | null;
+  contactMethods: unknown;
+  notes: string | null;
 }): number {
   let s = 0;
   if (c.dni || c.cuit) s += 30;
@@ -1676,15 +1962,19 @@ v1.post('/contacts', async (req, res, next) => {
   const lastName = str(b.lastName);
   const legalName = str(b.legalName);
   if (kind === 'PERSONA_JURIDICA') {
-    if (!legalName) { res.status(400).json({ error: 'La razón social es obligatoria.' }); return; }
+    if (!legalName) {
+      res.status(400).json({ error: 'La razón social es obligatoria.' });
+      return;
+    }
   } else if (!firstName && !lastName) {
-    res.status(400).json({ error: 'Nombre o apellido es obligatorio.' }); return;
+    res.status(400).json({ error: 'Nombre o apellido es obligatorio.' });
+    return;
   }
   const phone = str(b.phone);
   const contactMethods = phone ? [{ type: 'celular' as const, value: phone, primary: true }] : [];
   const ctx = req.authCtx!;
   try {
-    const out = await withAuthedTx(ctx, async (tx) => {
+    const out = await withAuthedTx(ctx, async tx => {
       const [row] = await tx
         .insert(contacts)
         .values({
@@ -1703,19 +1993,29 @@ v1.post('/contacts', async (req, res, next) => {
           dataQualityScore: qualityScoreOf({
             dni: kind === 'PERSONA_FISICA' ? digits(b.dni) : null,
             cuit: digits(b.cuit),
-            addressStreet: null, addressCity: str(b.city), addressProvince: null,
-            contactMethods, notes: str(b.notes),
+            addressStreet: null,
+            addressCity: str(b.city),
+            addressProvince: null,
+            contactMethods,
+            notes: str(b.notes),
           }),
         })
         .returning({ id: contacts.id });
       if (!row) throw new Error('alta contacto: el insert no devolvió fila');
       await writeAuditLogTx(tx, {
-        orgId: ctx.orgId, userId: ctx.userId, action: 'create_contact', entityType: 'contact', entityId: row.id, payload: { kind },
+        orgId: ctx.orgId,
+        userId: ctx.userId,
+        action: 'create_contact',
+        entityType: 'contact',
+        entityId: row.id,
+        payload: { kind },
       });
       return row;
     });
     res.status(201).json({ id: out.id });
-  } catch (err) { next(err); }
+  } catch (err) {
+    next(err);
+  }
 });
 
 // Edición del asegurado/contacto (F-010 medios múltiples · F-020 domicilio):
@@ -1727,7 +2027,10 @@ type MethodType = 'telefono' | 'celular' | 'email' | 'whatsapp';
 
 v1.patch('/contacts/:id', async (req, res, next) => {
   const id = req.params.id;
-  if (!isUuidV1(id)) { res.status(400).json({ error: 'Id inválido.' }); return; }
+  if (!isUuidV1(id)) {
+    res.status(400).json({ error: 'Id inválido.' });
+    return;
+  }
   const b = (req.body ?? {}) as Record<string, unknown>;
   const str = (v: unknown): string | null => (typeof v === 'string' && v.trim() !== '' ? v.trim() : null);
   const digits = (v: unknown): string | null => (typeof v === 'string' ? v.replace(/\D/g, '') : '') || null;
@@ -1748,14 +2051,23 @@ v1.patch('/contacts/:id', async (req, res, next) => {
   if ('addressPostalCode' in b) set.addressPostalCode = str(b.addressPostalCode);
 
   if ('contactMethods' in b) {
-    if (!Array.isArray(b.contactMethods)) { res.status(400).json({ error: 'contactMethods debe ser una lista.' }); return; }
-    if (b.contactMethods.length > 20) { res.status(400).json({ error: 'Demasiados medios de contacto (máx. 20).' }); return; }
+    if (!Array.isArray(b.contactMethods)) {
+      res.status(400).json({ error: 'contactMethods debe ser una lista.' });
+      return;
+    }
+    if (b.contactMethods.length > 20) {
+      res.status(400).json({ error: 'Demasiados medios de contacto (máx. 20).' });
+      return;
+    }
     const cleaned: Array<{ type: MethodType; value: string; primary: boolean }> = [];
     for (const raw of b.contactMethods as unknown[]) {
       const m = (raw ?? {}) as Record<string, unknown>;
       const type = typeof m.type === 'string' ? m.type : '';
       const value = typeof m.value === 'string' ? m.value.trim() : '';
-      if (!METHOD_TYPES.has(type)) { res.status(400).json({ error: `Tipo de contacto inválido: ${type || '—'}.` }); return; }
+      if (!METHOD_TYPES.has(type)) {
+        res.status(400).json({ error: `Tipo de contacto inválido: ${type || '—'}.` });
+        return;
+      }
       if (!value) continue; // descarta filas vacías
       cleaned.push({ type: type as MethodType, value, primary: Boolean(m.primary) });
     }
@@ -1771,26 +2083,34 @@ v1.patch('/contacts/:id', async (req, res, next) => {
 
   const ctx = req.authCtx!;
   try {
-    const out = await withAuthedTx(ctx, async (tx) => {
-      const [row] = await tx
-        .update(contacts)
-        .set(set)
-        .where(eq(contacts.id, id))
-        .returning({ id: contacts.id });
+    const out = await withAuthedTx(ctx, async tx => {
+      const [row] = await tx.update(contacts).set(set).where(eq(contacts.id, id)).returning({ id: contacts.id });
       if (!row) return null;
       // Recalcular la calidad de datos sobre la fila final (update parcial).
       const [full] = await tx.select().from(contacts).where(eq(contacts.id, id)).limit(1);
       if (full) {
-        await tx.update(contacts).set({ dataQualityScore: qualityScoreOf(full) }).where(eq(contacts.id, id));
+        await tx
+          .update(contacts)
+          .set({ dataQualityScore: qualityScoreOf(full) })
+          .where(eq(contacts.id, id));
       }
       await writeAuditLogTx(tx, {
-        orgId: ctx.orgId, userId: ctx.userId, action: 'update_contact', entityType: 'contact', entityId: id,
+        orgId: ctx.orgId,
+        userId: ctx.userId,
+        action: 'update_contact',
+        entityType: 'contact',
+        entityId: id,
       });
       return row;
     });
-    if (!out) { res.status(404).json({ error: 'Asegurado no encontrado.' }); return; }
+    if (!out) {
+      res.status(404).json({ error: 'Asegurado no encontrado.' });
+      return;
+    }
     res.json({ id: out.id });
-  } catch (err) { next(err); }
+  } catch (err) {
+    next(err);
+  }
 });
 
 // Edición de póliza: SOLO observaciones (regla del founder — las pólizas se
@@ -1800,21 +2120,31 @@ v1.patch('/contacts/:id', async (req, res, next) => {
 // con update_policy_notes / update_policy_payment_method del viejo).
 v1.patch('/policies/:id', async (req, res, next) => {
   const id = req.params.id;
-  if (!isUuidV1(id)) { res.status(400).json({ error: 'Id inválido.' }); return; }
+  if (!isUuidV1(id)) {
+    res.status(400).json({ error: 'Id inválido.' });
+    return;
+  }
   const body = (req.body ?? {}) as Record<string, unknown>;
   const hasNotes = typeof body.notes === 'string';
   const notes = hasNotes ? (body.notes as string).trim() : '';
-  if (notes.length > 4000) { res.status(400).json({ error: 'Observaciones demasiado largas.' }); return; }
+  if (notes.length > 4000) {
+    res.status(400).json({ error: 'Observaciones demasiado largas.' });
+    return;
+  }
   const hasPayment = 'paymentMethod' in body;
   const paymentRaw = body.paymentMethod;
   const payment = paymentRaw == null || paymentRaw === '' ? null : String(paymentRaw);
   if (hasPayment && payment !== null && !PAYMENT_METHOD_LABEL[payment]) {
-    res.status(400).json({ error: 'Forma de pago inválida.' }); return;
+    res.status(400).json({ error: 'Forma de pago inválida.' });
+    return;
   }
-  if (!hasNotes && !hasPayment) { res.status(400).json({ error: 'Nada para actualizar.' }); return; }
+  if (!hasNotes && !hasPayment) {
+    res.status(400).json({ error: 'Nada para actualizar.' });
+    return;
+  }
   const ctx = req.authCtx!;
   try {
-    const out = await withAuthedTx(ctx, async (tx) => {
+    const out = await withAuthedTx(ctx, async tx => {
       const set: Record<string, unknown> = { updatedAt: new Date() };
       if (hasNotes) set.notes = notes || null;
       if (hasPayment) set.paymentMethod = payment;
@@ -1826,20 +2156,33 @@ v1.patch('/policies/:id', async (req, res, next) => {
       if (!row) return null;
       if (hasNotes) {
         await writeAuditLogTx(tx, {
-          orgId: ctx.orgId, userId: ctx.userId, action: 'update_policy_notes', entityType: 'policy', entityId: id,
+          orgId: ctx.orgId,
+          userId: ctx.userId,
+          action: 'update_policy_notes',
+          entityType: 'policy',
+          entityId: id,
         });
       }
       if (hasPayment) {
         await writeAuditLogTx(tx, {
-          orgId: ctx.orgId, userId: ctx.userId, action: 'update_policy_payment_method', entityType: 'policy', entityId: id,
+          orgId: ctx.orgId,
+          userId: ctx.userId,
+          action: 'update_policy_payment_method',
+          entityType: 'policy',
+          entityId: id,
           payload: { paymentMethod: payment },
         });
       }
       return row;
     });
-    if (!out) { res.status(404).json({ error: 'Póliza no encontrada.' }); return; }
+    if (!out) {
+      res.status(404).json({ error: 'Póliza no encontrada.' });
+      return;
+    }
     res.json({ id: out.id, notes: out.notes, paymentMethod: paymentLabel(out.paymentMethod) });
-  } catch (err) { next(err); }
+  } catch (err) {
+    next(err);
+  }
 });
 
 // Aceptación de Términos y Privacidad (Ley 25.326): la marca el propio usuario
@@ -1848,7 +2191,7 @@ v1.patch('/policies/:id', async (req, res, next) => {
 v1.post('/me/accept-terms', async (req, res, next) => {
   const ctx = req.authCtx!;
   try {
-    const out = await withAuthedTx(ctx, async (tx) => {
+    const out = await withAuthedTx(ctx, async tx => {
       const [row] = await tx
         .update(users)
         .set({ termsAcceptedAt: sql`coalesce(${users.termsAcceptedAt}, now())`, updatedAt: new Date() })
@@ -1856,83 +2199,144 @@ v1.post('/me/accept-terms', async (req, res, next) => {
         .returning({ termsAcceptedAt: users.termsAcceptedAt });
       if (!row) return null;
       await writeAuditLogTx(tx, {
-        orgId: ctx.orgId, userId: ctx.userId, action: 'accept_terms', entityType: 'user', entityId: ctx.userId,
+        orgId: ctx.orgId,
+        userId: ctx.userId,
+        action: 'accept_terms',
+        entityType: 'user',
+        entityId: ctx.userId,
       });
       return row;
     });
-    if (!out) { res.status(404).json({ error: 'Usuario no encontrado.' }); return; }
+    if (!out) {
+      res.status(404).json({ error: 'Usuario no encontrado.' });
+      return;
+    }
     res.json({ termsAcceptedAt: out.termsAcceptedAt?.toISOString() ?? null });
-  } catch (err) { next(err); }
+  } catch (err) {
+    next(err);
+  }
 });
 
 // ── Slice 6: plantillas de mensajes propias del PAS (paridad E7/O-49) ────────
 // Los 4 built-in viven en el frontend; estas son las que el PAS crea/edita,
 // compartidas en la org (RLS). Variables {nombre} {poliza} {vencimiento}.
 
-v1.get('/message-templates', handle(async (tx) => ({
-  data: await tx
-    .select({ id: schema.messageTemplates.id, name: schema.messageTemplates.name, body: schema.messageTemplates.body })
-    .from(schema.messageTemplates)
-    .orderBy(asc(schema.messageTemplates.name)),
-})));
+v1.get(
+  '/message-templates',
+  handle(async tx => ({
+    data: await tx
+      .select({
+        id: schema.messageTemplates.id,
+        name: schema.messageTemplates.name,
+        body: schema.messageTemplates.body,
+      })
+      .from(schema.messageTemplates)
+      .orderBy(asc(schema.messageTemplates.name)),
+  })),
+);
 
 v1.post('/message-templates', async (req, res, next) => {
   const b = (req.body ?? {}) as Record<string, unknown>;
   const name = typeof b.name === 'string' ? b.name.trim().slice(0, 60) : '';
   const bodyText = typeof b.body === 'string' ? b.body.trim().slice(0, 2000) : '';
-  if (!name || !bodyText) { res.status(400).json({ error: 'Nombre y texto son obligatorios.' }); return; }
+  if (!name || !bodyText) {
+    res.status(400).json({ error: 'Nombre y texto son obligatorios.' });
+    return;
+  }
   const ctx = req.authCtx!;
   try {
-    const out = await withAuthedTx(ctx, async (tx) => {
-      const [row] = await tx.insert(schema.messageTemplates).values({ orgId: ctx.orgId, name, body: bodyText }).returning({ id: schema.messageTemplates.id });
+    const out = await withAuthedTx(ctx, async tx => {
+      const [row] = await tx
+        .insert(schema.messageTemplates)
+        .values({ orgId: ctx.orgId, name, body: bodyText })
+        .returning({ id: schema.messageTemplates.id });
       await writeAuditLogTx(tx, {
-        orgId: ctx.orgId, userId: ctx.userId, action: 'create_message_template', entityType: 'message_template', entityId: row!.id,
+        orgId: ctx.orgId,
+        userId: ctx.userId,
+        action: 'create_message_template',
+        entityType: 'message_template',
+        entityId: row!.id,
       });
       return row;
     });
     res.status(201).json(out);
-  } catch (err) { next(err); }
+  } catch (err) {
+    next(err);
+  }
 });
 
 v1.patch('/message-templates/:id', async (req, res, next) => {
   const id = req.params.id;
-  if (!isUuidV1(id)) { res.status(400).json({ error: 'Id inválido.' }); return; }
+  if (!isUuidV1(id)) {
+    res.status(400).json({ error: 'Id inválido.' });
+    return;
+  }
   const b = (req.body ?? {}) as Record<string, unknown>;
   const name = typeof b.name === 'string' ? b.name.trim().slice(0, 60) : '';
   const bodyText = typeof b.body === 'string' ? b.body.trim().slice(0, 2000) : '';
-  if (!name || !bodyText) { res.status(400).json({ error: 'Nombre y texto son obligatorios.' }); return; }
+  if (!name || !bodyText) {
+    res.status(400).json({ error: 'Nombre y texto son obligatorios.' });
+    return;
+  }
   const ctx = req.authCtx!;
   try {
-    const out = await withAuthedTx(ctx, async (tx) => {
-      const [row] = await tx.update(schema.messageTemplates).set({ name, body: bodyText, updatedAt: new Date() })
-        .where(eq(schema.messageTemplates.id, id)).returning({ id: schema.messageTemplates.id });
+    const out = await withAuthedTx(ctx, async tx => {
+      const [row] = await tx
+        .update(schema.messageTemplates)
+        .set({ name, body: bodyText, updatedAt: new Date() })
+        .where(eq(schema.messageTemplates.id, id))
+        .returning({ id: schema.messageTemplates.id });
       if (!row) return null;
       await writeAuditLogTx(tx, {
-        orgId: ctx.orgId, userId: ctx.userId, action: 'update_message_template', entityType: 'message_template', entityId: row.id,
+        orgId: ctx.orgId,
+        userId: ctx.userId,
+        action: 'update_message_template',
+        entityType: 'message_template',
+        entityId: row.id,
       });
       return row;
     });
-    if (!out) { res.status(404).json({ error: 'Plantilla no encontrada.' }); return; }
+    if (!out) {
+      res.status(404).json({ error: 'Plantilla no encontrada.' });
+      return;
+    }
     res.json({ ok: true });
-  } catch (err) { next(err); }
+  } catch (err) {
+    next(err);
+  }
 });
 
 v1.delete('/message-templates/:id', async (req, res, next) => {
   const id = req.params.id;
-  if (!isUuidV1(id)) { res.status(400).json({ error: 'Id inválido.' }); return; }
+  if (!isUuidV1(id)) {
+    res.status(400).json({ error: 'Id inválido.' });
+    return;
+  }
   const ctx = req.authCtx!;
   try {
-    const out = await withAuthedTx(ctx, async (tx) => {
-      const [row] = await tx.delete(schema.messageTemplates).where(eq(schema.messageTemplates.id, id)).returning({ id: schema.messageTemplates.id });
+    const out = await withAuthedTx(ctx, async tx => {
+      const [row] = await tx
+        .delete(schema.messageTemplates)
+        .where(eq(schema.messageTemplates.id, id))
+        .returning({ id: schema.messageTemplates.id });
       if (!row) return null;
       await writeAuditLogTx(tx, {
-        orgId: ctx.orgId, userId: ctx.userId, action: 'delete_message_template', entityType: 'message_template', entityId: row.id,
+        orgId: ctx.orgId,
+        userId: ctx.userId,
+        action: 'delete_message_template',
+        entityType: 'message_template',
+        entityId: row.id,
       });
       return row;
     });
-    if (!out) { res.status(404).json({ error: 'Plantilla no encontrada.' }); return; }
+    if (!out) {
+      res.status(404).json({ error: 'Plantilla no encontrada.' });
+      return;
+    }
     res.json({ ok: true });
-  } catch (err) { next(err); }
+  } catch (err) {
+    next(err);
+  }
 });
 
 // ── Slice 6: import de asegurados (paridad contacts.import) ─────────────────
@@ -1940,10 +2344,17 @@ v1.delete('/message-templates/:id', async (req, res, next) => {
 // (drawer Importar CSV) parsea y mapea client-side; acá llegan filas limpias.
 v1.post('/contacts/import', async (req, res, next) => {
   const rowsIn = (req.body ?? {}).rows;
-  if (!Array.isArray(rowsIn) || rowsIn.length === 0) { res.status(400).json({ error: 'Sin filas para importar.' }); return; }
-  if (rowsIn.length > 5000) { res.status(400).json({ error: 'Máximo 5000 filas por import.' }); return; }
+  if (!Array.isArray(rowsIn) || rowsIn.length === 0) {
+    res.status(400).json({ error: 'Sin filas para importar.' });
+    return;
+  }
+  if (rowsIn.length > 5000) {
+    res.status(400).json({ error: 'Máximo 5000 filas por import.' });
+    return;
+  }
   const ctx = req.authCtx!;
-  const str = (v: unknown, max = 200): string | null => (typeof v === 'string' && v.trim() !== '' ? v.trim().slice(0, max) : null);
+  const str = (v: unknown, max = 200): string | null =>
+    typeof v === 'string' && v.trim() !== '' ? v.trim().slice(0, max) : null;
   const digits = (v: unknown): string | null => (typeof v === 'string' ? v.replace(/\D/g, '') : '') || null;
   try {
     // Dedup contra TODA la org (cliente owner, scopeado por org_id a mano): bajo
@@ -1953,22 +2364,28 @@ v1.post('/contacts/import', async (req, res, next) => {
       .select({ dni: contacts.dni, cuit: contacts.cuit })
       .from(contacts)
       .where(eq(contacts.orgId, ctx.orgId));
-    const out = await withAuthedTx(ctx, async (tx) => {
-      const seenDni = new Set(existing.map((e) => e.dni).filter(Boolean) as string[]);
-      const seenCuit = new Set(existing.map((e) => e.cuit).filter(Boolean) as string[]);
+    const out = await withAuthedTx(ctx, async tx => {
+      const seenDni = new Set(existing.map(e => e.dni).filter(Boolean) as string[]);
+      const seenCuit = new Set(existing.map(e => e.cuit).filter(Boolean) as string[]);
 
       const toInsert: (typeof contacts.$inferInsert)[] = [];
       let skippedDuplicates = 0;
       let skippedInvalid = 0;
       for (const raw of rowsIn as Record<string, unknown>[]) {
-        const kind = raw.kind === 'PERSONA_JURIDICA' ? 'PERSONA_JURIDICA' as const : 'PERSONA_FISICA' as const;
+        const kind = raw.kind === 'PERSONA_JURIDICA' ? ('PERSONA_JURIDICA' as const) : ('PERSONA_FISICA' as const);
         const firstName = kind === 'PERSONA_FISICA' ? str(raw.firstName, 80) : null;
         const lastName = kind === 'PERSONA_FISICA' ? str(raw.lastName, 80) : null;
         const legalName = kind === 'PERSONA_JURIDICA' ? str(raw.legalName, 160) : null;
-        if (kind === 'PERSONA_JURIDICA' ? !legalName : (!firstName && !lastName)) { skippedInvalid++; continue; }
+        if (kind === 'PERSONA_JURIDICA' ? !legalName : !firstName && !lastName) {
+          skippedInvalid++;
+          continue;
+        }
         const dni = kind === 'PERSONA_FISICA' ? digits(raw.dni) : null;
         const cuit = digits(raw.cuit);
-        if ((dni && seenDni.has(dni)) || (cuit && seenCuit.has(cuit))) { skippedDuplicates++; continue; }
+        if ((dni && seenDni.has(dni)) || (cuit && seenCuit.has(cuit))) {
+          skippedDuplicates++;
+          continue;
+        }
         if (dni) seenDni.add(dni);
         if (cuit) seenCuit.add(cuit);
         const methods: Array<{ type: 'telefono' | 'celular' | 'email'; value: string; primary: boolean }> = [];
@@ -1979,7 +2396,12 @@ v1.post('/contacts/import', async (req, res, next) => {
         const row: typeof contacts.$inferInsert = {
           orgId: ctx.orgId,
           producerId: ctx.producerId,
-          kind, firstName, lastName, legalName, dni, cuit,
+          kind,
+          firstName,
+          lastName,
+          legalName,
+          dni,
+          cuit,
           status: raw.status === 'prospecto' ? 'prospecto' : 'asegurado',
           notes: str(raw.notes, 4000),
           addressStreet: str(raw.addressStreet, 120),
@@ -1989,9 +2411,13 @@ v1.post('/contacts/import', async (req, res, next) => {
           source: 'import_csv',
         };
         row.dataQualityScore = qualityScoreOf({
-          dni: row.dni ?? null, cuit: row.cuit ?? null,
-          addressStreet: row.addressStreet ?? null, addressCity: row.addressCity ?? null, addressProvince: row.addressProvince ?? null,
-          contactMethods: methods, notes: row.notes ?? null,
+          dni: row.dni ?? null,
+          cuit: row.cuit ?? null,
+          addressStreet: row.addressStreet ?? null,
+          addressCity: row.addressCity ?? null,
+          addressProvince: row.addressProvince ?? null,
+          contactMethods: methods,
+          notes: row.notes ?? null,
         });
         toInsert.push(row);
       }
@@ -2002,13 +2428,18 @@ v1.post('/contacts/import', async (req, res, next) => {
         created = inserted.length;
       }
       await writeAuditLogTx(tx, {
-        orgId: ctx.orgId, userId: ctx.userId, action: 'import_contacts', entityType: 'contact',
+        orgId: ctx.orgId,
+        userId: ctx.userId,
+        action: 'import_contacts',
+        entityType: 'contact',
         payload: { created, skippedDuplicates, skippedInvalid, total: rowsIn.length },
       });
       return { created, skippedDuplicates, skippedInvalid, total: rowsIn.length };
     });
     res.json(out);
-  } catch (err) { next(err); }
+  } catch (err) {
+    next(err);
+  }
 });
 
 // ── Slice 5: cuenta (export, perfil fiscal del PAS, borrado) ─────────────────
@@ -2017,7 +2448,7 @@ v1.post('/contacts/import', async (req, res, next) => {
 // organizador toda la org. JSON descargable.
 v1.get('/account/export', async (req, res, next) => {
   try {
-    const out = await withAuthedTx(req.authCtx!, async (tx) => ({
+    const out = await withAuthedTx(req.authCtx!, async tx => ({
       exportedAt: new Date().toISOString(),
       contacts: await tx.select().from(contacts),
       insurers: await tx.select().from(insurers),
@@ -2028,7 +2459,9 @@ v1.get('/account/export', async (req, res, next) => {
     }));
     res.setHeader('Content-Disposition', `attachment; filename="rumbo-export-${out.exportedAt.slice(0, 10)}.json"`);
     res.json(out);
-  } catch (err) { next(err); }
+  } catch (err) {
+    next(err);
+  }
 });
 
 // CUIT AR: 11 dígitos con dígito verificador (módulo 11).
@@ -2053,32 +2486,44 @@ v1.patch('/org', requireOwner, async (req, res, next) => {
   const set: Partial<typeof organizations.$inferInsert> = {};
   if ('cuit' in b) {
     const cuit = typeof b.cuit === 'string' ? b.cuit.replace(/\D/g, '') || null : null;
-    if (cuit !== null && !isValidCuit(cuit)) { res.status(400).json({ error: 'CUIT inválido: revisá los 11 dígitos.' }); return; }
+    if (cuit !== null && !isValidCuit(cuit)) {
+      res.status(400).json({ error: 'CUIT inválido: revisá los 11 dígitos.' });
+      return;
+    }
     set.cuit = cuit;
   }
   if ('ssnMatricula' in b) {
     set.ssnMatricula = typeof b.ssnMatricula === 'string' ? b.ssnMatricula.trim().slice(0, 20) || null : null;
   }
   if ('fiscalCondition' in b) {
-    set.fiscalCondition = (FISCAL_CONDITIONS.includes(String(b.fiscalCondition))
-      ? String(b.fiscalCondition)
-      : null) as (typeof organizations.$inferInsert)['fiscalCondition'];
+    set.fiscalCondition = (
+      FISCAL_CONDITIONS.includes(String(b.fiscalCondition)) ? String(b.fiscalCondition) : null
+    ) as (typeof organizations.$inferInsert)['fiscalCondition'];
   }
-  if (Object.keys(set).length === 0) { res.status(400).json({ error: 'Nada para actualizar.' }); return; }
+  if (Object.keys(set).length === 0) {
+    res.status(400).json({ error: 'Nada para actualizar.' });
+    return;
+  }
   const ctx = req.authCtx!;
   try {
-    await withAuthedTx(ctx, async (tx) => {
+    await withAuthedTx(ctx, async tx => {
       const [row] = await tx
         .update(organizations)
         .set(set)
         .where(eq(organizations.id, ctx.orgId))
         .returning({ id: organizations.id });
       await writeAuditLogTx(tx, {
-        orgId: ctx.orgId, userId: ctx.userId, action: 'update_org_profile', entityType: 'organization', entityId: row!.id,
+        orgId: ctx.orgId,
+        userId: ctx.userId,
+        action: 'update_org_profile',
+        entityType: 'organization',
+        entityId: row!.id,
       });
     });
     res.json({ ok: true });
-  } catch (err) { next(err); }
+  } catch (err) {
+    next(err);
+  }
 });
 
 // Borrado de cuenta + TODOS los datos (F-063, Ley 25.326) — solo organizador.
@@ -2090,7 +2535,7 @@ v1.delete('/account', requireOwner, async (req, res, next) => {
   try {
     // Todo-o-nada: si un delete falla, revierte entero (sin org borrada con
     // credenciales vivas ni estados a medias — la operación es irreversible).
-    await db.transaction(async (tx) => {
+    await db.transaction(async tx => {
       await tx.delete(organizations).where(eq(organizations.id, ctx.orgId));
       await tx.delete(schema.sessions).where(eq(schema.sessions.userId, ctx.userId));
       await tx.delete(schema.accounts).where(eq(schema.accounts.userId, ctx.userId));
@@ -2098,14 +2543,22 @@ v1.delete('/account', requireOwner, async (req, res, next) => {
       await tx.delete(users).where(eq(users.id, ctx.userId));
     });
     res.json({ ok: true });
-  } catch (err) { next(err); }
+  } catch (err) {
+    next(err);
+  }
 });
 
 // Organización activa y usuario de la sesión (para el chrome del cockpit).
-v1.get('/org', handle(async (tx) => (await loadOrg(tx)) ?? {}));
-v1.get('/me', handle(async (_tx, ctx) => ({
-  userId: ctx.userId,
-  orgId: ctx.orgId,
-  role: ctx.role,
-  roleLabel: ROLE_LABEL[ctx.role] ?? 'Productor',
-})));
+v1.get(
+  '/org',
+  handle(async tx => (await loadOrg(tx)) ?? {}),
+);
+v1.get(
+  '/me',
+  handle(async (_tx, ctx) => ({
+    userId: ctx.userId,
+    orgId: ctx.orgId,
+    role: ctx.role,
+    roleLabel: ROLE_LABEL[ctx.role] ?? 'Productor',
+  })),
+);

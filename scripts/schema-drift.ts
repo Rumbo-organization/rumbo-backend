@@ -27,9 +27,17 @@ for (const t of tables) {
     drift++;
     continue;
   }
-  const inSchema = new Set(cfg.columns.map((c) => c.name));
-  for (const c of inSchema) if (!inDb.has(c)) { console.log(`${cfg.name}: schema-only column '${c}' (DB no la tiene)`); drift++; }
-  for (const c of inDb) if (!inSchema.has(c)) { console.log(`${cfg.name}: db-only column '${c}' (schema no la tiene)`); drift++; }
+  const inSchema = new Set(cfg.columns.map(c => c.name));
+  for (const c of inSchema)
+    if (!inDb.has(c)) {
+      console.log(`${cfg.name}: schema-only column '${c}' (DB no la tiene)`);
+      drift++;
+    }
+  for (const c of inDb)
+    if (!inSchema.has(c)) {
+      console.log(`${cfg.name}: db-only column '${c}' (schema no la tiene)`);
+      drift++;
+    }
 }
 console.log(drift === 0 ? 'OK sin drift' : `${drift} drifts`);
 await pool.end();

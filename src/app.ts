@@ -56,8 +56,14 @@ app.get('/api/health', async (_req, res) => {
 // org/productor en el código (PARIDAD §5, "batch/sistema").
 app.get('/api/cron/expiry-notifications', async (req, res) => {
   const secret = process.env.CRON_SECRET;
-  if (!secret) { res.status(503).json({ error: 'CRON_SECRET sin configurar.' }); return; }
-  if (req.headers.authorization !== `Bearer ${secret}`) { res.status(401).json({ error: 'No autorizado.' }); return; }
+  if (!secret) {
+    res.status(503).json({ error: 'CRON_SECRET sin configurar.' });
+    return;
+  }
+  if (req.headers.authorization !== `Bearer ${secret}`) {
+    res.status(401).json({ error: 'No autorizado.' });
+    return;
+  }
   try {
     const { runExpiryNotifications } = await import('./expiry-job.js');
     const result = await runExpiryNotifications();

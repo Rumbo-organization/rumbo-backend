@@ -117,7 +117,7 @@ export const auth = betterAuth({
         // Gating de beta privada (paridad §4): con BETA_ALLOWLIST=on solo se
         // registran emails anotados en la waitlist. El founder habilita gente
         // insertándola ahí (script add-to-waitlist del monolito, misma DB).
-        before: async (user) => {
+        before: async user => {
           if (process.env.BETA_ALLOWLIST !== 'on') return;
           const [hit] = await db
             .select({ id: schema.waitlist.id })
@@ -140,7 +140,7 @@ export const auth = betterAuth({
         // no tiene ninguna, la provisiona (onboarding automático: org + owner +
         // productor self). Así ningún login queda sin org → el cockpit siempre
         // se hidrata contra datos reales, nunca cae al demo estático.
-        before: async (session) => {
+        before: async session => {
           const orgId = await ensureUserOrg(session.userId);
           return {
             data: { ...session, activeOrganizationId: orgId },
@@ -169,8 +169,5 @@ export const auth = betterAuth({
     },
   },
 
-  plugins: [
-    organization(),
-    twoFactor({ issuer: process.env.APP_NAME ?? 'Rumbo' }),
-  ],
+  plugins: [organization(), twoFactor({ issuer: process.env.APP_NAME ?? 'Rumbo' })],
 });

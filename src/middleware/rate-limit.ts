@@ -35,7 +35,7 @@ export function writeRateLimit(max = 60, windowMs = 60_000) {
           }
           next();
         })
-        .catch((err) => {
+        .catch(err => {
           console.error('[rate-limit] Redis caído, fail-open:', err);
           next();
         });

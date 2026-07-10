@@ -1,7 +1,7 @@
-# CI de la API: instala y typechequea (npm run build = tsc). Sin lint ni tests
-# configurados todavía; cuando existan (`npm run lint` / `npm test`), agregar
-# los pasos acá. El deploy y su status en el PR los maneja la integración de
-# Vercel.
+# CI de la API: formato (prettier --check), instala y typechequea (build = tsc).
+# Sin lint ni tests configurados todavía; cuando existan (`pnpm lint` /
+# `pnpm test`), agregar los pasos acá. El deploy y su status en el PR los maneja
+# la integración de Vercel.
 name: CI
 
 on:
@@ -22,4 +22,5 @@ jobs:
           node-version: 24
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - run: pnpm run format:check
       - run: pnpm run build

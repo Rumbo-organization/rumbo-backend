@@ -20,11 +20,26 @@ import { writeAuditLogTx } from '../audit.js';
 const { claims, claimEvents, contacts, insurers, policies, users } = schema;
 
 // ── Etiquetas (mismo criterio que routes/v1.ts) ──────────────────────────────
-const CLAIM_TYPES = ['robo', 'choque', 'incendio', 'danos_agua', 'granizo', 'cristales', 'resp_civil', 'otros'] as const;
+const CLAIM_TYPES = [
+  'robo',
+  'choque',
+  'incendio',
+  'danos_agua',
+  'granizo',
+  'cristales',
+  'resp_civil',
+  'otros',
+] as const;
 type ClaimType = (typeof CLAIM_TYPES)[number];
 const CLAIM_TYPE_LABEL: Record<string, string> = {
-  robo: 'Robo', choque: 'Choque', incendio: 'Incendio', danos_agua: 'Daños por agua',
-  granizo: 'Granizo', cristales: 'Cristales', resp_civil: 'Resp. civil', otros: 'Otro',
+  robo: 'Robo',
+  choque: 'Choque',
+  incendio: 'Incendio',
+  danos_agua: 'Daños por agua',
+  granizo: 'Granizo',
+  cristales: 'Cristales',
+  resp_civil: 'Resp. civil',
+  otros: 'Otro',
 };
 const CLAIM_STATUS_LABEL: Record<string, string> = { abierto: 'Abierto', en_curso: 'En curso', cerrado: 'Cerrado' };
 const CLAIM_STATUS = ['abierto', 'en_curso', 'cerrado'] as const;
@@ -74,21 +89,36 @@ async function policyOwned(tx: AuthedTx, policyId: string): Promise<boolean> {
 // descripción, prioridad. Devuelve { id } (el frontend re-hidrata el board).
 claimsRouter.post('/', async (req: Request, res: Response, next: NextFunction) => {
   const b = (req.body ?? {}) as Record<string, unknown>;
-  if (!isUuid(b.policyId)) { res.status(400).json({ error: 'Póliza inválida.' }); return; }
-  if (!(CLAIM_TYPES as readonly string[]).includes(b.tipo as string)) { res.status(400).json({ error: 'Tipo inválido.' }); return; }
+  if (!isUuid(b.policyId)) {
+    res.status(400).json({ error: 'Póliza inválida.' });
+    return;
+  }
+  if (!(CLAIM_TYPES as readonly string[]).includes(b.tipo as string)) {
+    res.status(400).json({ error: 'Tipo inválido.' });
+    return;
+  }
   const reportedBy = typeof b.reportedBy === 'string' ? b.reportedBy.trim() : '';
-  if (reportedBy.length < 1) { res.status(400).json({ error: 'El denunciante es obligatorio.' }); return; }
+  if (reportedBy.length < 1) {
+    res.status(400).json({ error: 'El denunciante es obligatorio.' });
+    return;
+  }
   const when = typeof b.occurredAt === 'string' ? new Date(b.occurredAt) : new Date(NaN);
-  if (Number.isNaN(when.getTime())) { res.status(400).json({ error: 'Fecha y hora del hecho inválidas.' }); return; }
+  if (Number.isNaN(when.getTime())) {
+    res.status(400).json({ error: 'Fecha y hora del hecho inválidas.' });
+    return;
+  }
   let importance: ClaimImportance | null = null;
   if (b.importance != null && b.importance !== '') {
-    if (!(CLAIM_IMPORTANCES as readonly string[]).includes(b.importance as string)) { res.status(400).json({ error: 'Prioridad inválida.' }); return; }
+    if (!(CLAIM_IMPORTANCES as readonly string[]).includes(b.importance as string)) {
+      res.status(400).json({ error: 'Prioridad inválida.' });
+      return;
+    }
     importance = b.importance as ClaimImportance;
   }
   const opt = (v: unknown) => (typeof v === 'string' && v.trim() !== '' ? v.trim() : null);
   const ctx = req.authCtx!;
   try {
-    const out = await withAuthedTx(ctx, async (tx) => {
+    const out = await withAuthedTx(ctx, async tx => {
       if (!(await policyOwned(tx, b.policyId as string))) return null;
       const [row] = await tx
         .insert(claims)
@@ -106,22 +136,34 @@ claimsRouter.post('/', async (req: Request, res: Response, next: NextFunction) =
         .returning({ id: claims.id });
       if (!row) return null;
       await writeAuditLogTx(tx, {
-        orgId: ctx.orgId, userId: ctx.userId, action: 'create_claim',
-        entityType: 'claim', entityId: row.id, payload: { tipo: b.tipo, policyId: b.policyId },
+        orgId: ctx.orgId,
+        userId: ctx.userId,
+        action: 'create_claim',
+        entityType: 'claim',
+        entityId: row.id,
+        payload: { tipo: b.tipo, policyId: b.policyId },
       });
       return row;
     });
-    if (!out) { res.status(404).json({ error: 'Póliza no encontrada.' }); return; }
+    if (!out) {
+      res.status(404).json({ error: 'Póliza no encontrada.' });
+      return;
+    }
     res.status(201).json({ id: out.id });
-  } catch (err) { next(err); }
+  } catch (err) {
+    next(err);
+  }
 });
 
 // GET /claims/:id — ficha del siniestro + timeline (comentarios + cambios de estado).
 claimsRouter.get('/:id', async (req: Request, res: Response, next: NextFunction) => {
   const id = req.params.id;
-  if (!isUuid(id)) { res.status(400).json({ error: 'Id inválido.' }); return; }
+  if (!isUuid(id)) {
+    res.status(400).json({ error: 'Id inválido.' });
+    return;
+  }
   try {
-    const data = await withAuthedTx(req.authCtx!, async (tx) => {
+    const data = await withAuthedTx(req.authCtx!, async tx => {
       const now = new Date();
       const [row] = await tx
         .select({
@@ -153,7 +195,7 @@ claimsRouter.get('/:id', async (req: Request, res: Response, next: NextFunction)
         num: c.claimNumber ?? '—',
         tipo: CLAIM_TYPE_LABEL[c.tipo] ?? c.tipo,
         status: CLAIM_STATUS_LABEL[c.status] ?? c.status,
-        importance: c.importance ? CLAIM_IMPORTANCE_LABEL[c.importance] ?? c.importance : null,
+        importance: c.importance ? (CLAIM_IMPORTANCE_LABEL[c.importance] ?? c.importance) : null,
         client: displayName(row),
         insurer: row.insurerName ?? '—',
         policyId: c.policyId,
@@ -175,20 +217,31 @@ claimsRouter.get('/:id', async (req: Request, res: Response, next: NextFunction)
         })),
       };
     });
-    if (!data) { res.status(404).json({ error: 'Siniestro no encontrado.' }); return; }
+    if (!data) {
+      res.status(404).json({ error: 'Siniestro no encontrado.' });
+      return;
+    }
     res.json(data);
-  } catch (err) { next(err); }
+  } catch (err) {
+    next(err);
+  }
 });
 
 // PATCH /claims/:id/status — cambia el estado + evento de timeline + audit.
 claimsRouter.patch('/:id/status', async (req: Request, res: Response, next: NextFunction) => {
   const id = req.params.id;
-  if (!isUuid(id)) { res.status(400).json({ error: 'Id inválido.' }); return; }
+  if (!isUuid(id)) {
+    res.status(400).json({ error: 'Id inválido.' });
+    return;
+  }
   const status = (req.body ?? {}).status as unknown;
-  if (!(CLAIM_STATUS as readonly string[]).includes(status as string)) { res.status(400).json({ error: 'Estado inválido.' }); return; }
+  if (!(CLAIM_STATUS as readonly string[]).includes(status as string)) {
+    res.status(400).json({ error: 'Estado inválido.' });
+    return;
+  }
   const ctx = req.authCtx!;
   try {
-    const out = await withAuthedTx(ctx, async (tx) => {
+    const out = await withAuthedTx(ctx, async tx => {
       const now = new Date();
       const [row] = await tx
         .update(claims)
@@ -197,32 +250,52 @@ claimsRouter.patch('/:id/status', async (req: Request, res: Response, next: Next
         .returning({ id: claims.id, status: claims.status });
       if (!row) return null;
       await tx.insert(claimEvents).values({
-        orgId: ctx.orgId, claimId: id, kind: 'status_change', newStatus: status as ClaimStatus, authorUserId: ctx.userId,
+        orgId: ctx.orgId,
+        claimId: id,
+        kind: 'status_change',
+        newStatus: status as ClaimStatus,
+        authorUserId: ctx.userId,
       });
       await writeAuditLogTx(tx, {
-        orgId: ctx.orgId, userId: ctx.userId, action: 'update_claim_status', entityType: 'claim', entityId: id, payload: { status },
+        orgId: ctx.orgId,
+        userId: ctx.userId,
+        action: 'update_claim_status',
+        entityType: 'claim',
+        entityId: id,
+        payload: { status },
       });
       return row;
     });
-    if (!out) { res.status(404).json({ error: 'Siniestro no encontrado.' }); return; }
+    if (!out) {
+      res.status(404).json({ error: 'Siniestro no encontrado.' });
+      return;
+    }
     res.json({ id: out.id, status: CLAIM_STATUS_LABEL[out.status] ?? out.status, stale: 0 });
-  } catch (err) { next(err); }
+  } catch (err) {
+    next(err);
+  }
 });
 
 // PATCH /claims/:id/importance — prioridad del PAS (alta/media/baja | null). No
 // es "movimiento" del siniestro (no bumpea lastActivity): es triage.
 claimsRouter.patch('/:id/importance', async (req: Request, res: Response, next: NextFunction) => {
   const id = req.params.id;
-  if (!isUuid(id)) { res.status(400).json({ error: 'Id inválido.' }); return; }
+  if (!isUuid(id)) {
+    res.status(400).json({ error: 'Id inválido.' });
+    return;
+  }
   const raw = (req.body ?? {}).importance as unknown;
   let importance: ClaimImportance | null = null;
   if (raw != null && raw !== '') {
-    if (!(CLAIM_IMPORTANCES as readonly string[]).includes(raw as string)) { res.status(400).json({ error: 'Prioridad inválida.' }); return; }
+    if (!(CLAIM_IMPORTANCES as readonly string[]).includes(raw as string)) {
+      res.status(400).json({ error: 'Prioridad inválida.' });
+      return;
+    }
     importance = raw as ClaimImportance;
   }
   const ctx = req.authCtx!;
   try {
-    const out = await withAuthedTx(ctx, async (tx) => {
+    const out = await withAuthedTx(ctx, async tx => {
       const [row] = await tx
         .update(claims)
         .set({ importance, updatedAt: new Date() })
@@ -230,25 +303,47 @@ claimsRouter.patch('/:id/importance', async (req: Request, res: Response, next: 
         .returning({ id: claims.id, importance: claims.importance });
       if (!row) return null;
       await writeAuditLogTx(tx, {
-        orgId: ctx.orgId, userId: ctx.userId, action: 'update_claim_importance', entityType: 'claim', entityId: id, payload: { importance },
+        orgId: ctx.orgId,
+        userId: ctx.userId,
+        action: 'update_claim_importance',
+        entityType: 'claim',
+        entityId: id,
+        payload: { importance },
       });
       return row;
     });
-    if (!out) { res.status(404).json({ error: 'Siniestro no encontrado.' }); return; }
-    res.json({ id: out.id, importance: out.importance ? CLAIM_IMPORTANCE_LABEL[out.importance] ?? out.importance : null });
-  } catch (err) { next(err); }
+    if (!out) {
+      res.status(404).json({ error: 'Siniestro no encontrado.' });
+      return;
+    }
+    res.json({
+      id: out.id,
+      importance: out.importance ? (CLAIM_IMPORTANCE_LABEL[out.importance] ?? out.importance) : null,
+    });
+  } catch (err) {
+    next(err);
+  }
 });
 
 // POST /claims/:id/comments — comentario al timeline + bump de last_activity.
 claimsRouter.post('/:id/comments', async (req: Request, res: Response, next: NextFunction) => {
   const id = req.params.id;
-  if (!isUuid(id)) { res.status(400).json({ error: 'Id inválido.' }); return; }
+  if (!isUuid(id)) {
+    res.status(400).json({ error: 'Id inválido.' });
+    return;
+  }
   const body = typeof (req.body ?? {}).body === 'string' ? (req.body.body as string).trim() : '';
-  if (body.length < 1) { res.status(400).json({ error: 'El comentario está vacío.' }); return; }
-  if (body.length > 2000) { res.status(400).json({ error: 'El comentario es demasiado largo.' }); return; }
+  if (body.length < 1) {
+    res.status(400).json({ error: 'El comentario está vacío.' });
+    return;
+  }
+  if (body.length > 2000) {
+    res.status(400).json({ error: 'El comentario es demasiado largo.' });
+    return;
+  }
   const ctx = req.authCtx!;
   try {
-    const out = await withAuthedTx(ctx, async (tx) => {
+    const out = await withAuthedTx(ctx, async tx => {
       const now = new Date();
       // El siniestro debe ser visible (RLS) para comentar: chequeo + bump.
       const [claim] = await tx
@@ -262,11 +357,20 @@ claimsRouter.post('/:id/comments', async (req: Request, res: Response, next: Nex
         .values({ orgId: ctx.orgId, claimId: id, kind: 'comment', body, authorUserId: ctx.userId })
         .returning({ id: claimEvents.id });
       await writeAuditLogTx(tx, {
-        orgId: ctx.orgId, userId: ctx.userId, action: 'comment_claim', entityType: 'claim', entityId: id,
+        orgId: ctx.orgId,
+        userId: ctx.userId,
+        action: 'comment_claim',
+        entityType: 'claim',
+        entityId: id,
       });
       return ev ?? { id: '' };
     });
-    if (!out) { res.status(404).json({ error: 'Siniestro no encontrado.' }); return; }
+    if (!out) {
+      res.status(404).json({ error: 'Siniestro no encontrado.' });
+      return;
+    }
     res.status(201).json({ ok: true });
-  } catch (err) { next(err); }
+  } catch (err) {
+    next(err);
+  }
 });

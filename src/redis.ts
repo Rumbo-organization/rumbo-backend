@@ -24,17 +24,14 @@ async function pipeline(cmds: (string | number)[][]): Promise<unknown[]> {
   });
   if (!r.ok) throw new Error(`Upstash ${r.status}`);
   const out = (await r.json()) as Array<{ result?: unknown; error?: string }>;
-  const failed = out.find((x) => x.error);
+  const failed = out.find(x => x.error);
   if (failed) throw new Error(`Upstash: ${failed.error}`);
-  return out.map((x) => x.result);
+  return out.map(x => x.result);
 }
 
 // Contador de ventana fija: INCR + EXPIRE NX (solo la primera vez fija el
 // vencimiento). Devuelve el conteo de la ventana y el TTL restante (Retry-After).
-export async function incrWindow(
-  key: string,
-  windowSec: number,
-): Promise<{ count: number; ttl: number }> {
+export async function incrWindow(key: string, windowSec: number): Promise<{ count: number; ttl: number }> {
   const [count, , ttl] = await pipeline([
     ['INCR', key],
     ['EXPIRE', key, windowSec, 'NX'],

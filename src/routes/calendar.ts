@@ -39,7 +39,7 @@ const RAMO_LABEL: Record<string, string> = {
   embarcaciones: 'Integral',
   otros: 'Integral',
 };
-const ramoLabel = (r: string | null): string => (r ? RAMO_LABEL[r] ?? 'Integral' : 'Integral');
+const ramoLabel = (r: string | null): string => (r ? (RAMO_LABEL[r] ?? 'Integral') : 'Integral');
 
 const CLAIM_TIPO_LABEL: Record<string, string> = {
   robo: 'Robo',
@@ -61,7 +61,7 @@ const PAYMENT_METHOD_LABEL: Record<string, string> = {
   debito_bancario: 'Débito bancario',
   tarjeta_credito: 'Tarjeta de crédito',
 };
-const paymentLabel = (m: string | null): string | null => (m ? PAYMENT_METHOD_LABEL[m] ?? m : null);
+const paymentLabel = (m: string | null): string | null => (m ? (PAYMENT_METHOD_LABEL[m] ?? m) : null);
 
 const CALENDAR_EVENT_KINDS = ['llamada', 'reunion', 'tramite', 'otro'] as const;
 type CalendarEventKind = (typeof CALENDAR_EVENT_KINDS)[number];
@@ -172,26 +172,21 @@ function parseEventBody(body: unknown): { data: EventInput } | { error: string }
 // que solo ven filas de la org/cartera de quien escribe. Lanza si no pertenece.
 async function assertOwned(tx: AuthedTx, input: EventInput): Promise<void> {
   if (input.contactId) {
-    const [c] = await tx
-      .select({ id: contacts.id })
-      .from(contacts)
-      .where(eq(contacts.id, input.contactId))
-      .limit(1);
+    const [c] = await tx.select({ id: contacts.id }).from(contacts).where(eq(contacts.id, input.contactId)).limit(1);
     if (!c) throw httpError(404, 'Asegurado no encontrado.');
   }
   if (input.policyId) {
-    const [p] = await tx
-      .select({ id: policies.id })
-      .from(policies)
-      .where(eq(policies.id, input.policyId))
-      .limit(1);
+    const [p] = await tx.select({ id: policies.id }).from(policies).where(eq(policies.id, input.policyId)).limit(1);
     if (!p) throw httpError(404, 'Póliza no encontrada.');
   }
 }
 
 // Error con status para el handler central (mapea a JSON { error }).
 class HttpError extends Error {
-  constructor(public status: number, message: string) {
+  constructor(
+    public status: number,
+    message: string,
+  ) {
     super(message);
   }
 }
@@ -212,7 +207,7 @@ calendar.get('/', async (req: Request, res: Response, next: NextFunction) => {
     const month = Number.isInteger(m) && m >= 1 && m <= 12 ? m : now.getUTCMonth() + 1;
     const { from, to } = monthRange(year, month);
 
-    const data = await withAuthedTx(req.authCtx!, async (tx) => {
+    const data = await withAuthedTx(req.authCtx!, async tx => {
       const vencimientos = await tx
         .select({
           id: policies.id,
@@ -224,9 +219,7 @@ calendar.get('/', async (req: Request, res: Response, next: NextFunction) => {
         })
         .from(policies)
         .innerJoin(contacts, eq(contacts.id, policies.contactId))
-        .where(
-          and(eq(policies.status, 'vigente'), gte(policies.endDate, from), lte(policies.endDate, to)),
-        )
+        .where(and(eq(policies.status, 'vigente'), gte(policies.endDate, from), lte(policies.endDate, to)))
         .orderBy(asc(policies.endDate));
 
       const cuotas = await tx
@@ -263,9 +256,7 @@ calendar.get('/', async (req: Request, res: Response, next: NextFunction) => {
         .from(claims)
         .innerJoin(policies, eq(policies.id, claims.policyId))
         .innerJoin(contacts, eq(contacts.id, policies.contactId))
-        .where(
-          and(sql`${claims.occurredAt}::date >= ${from}`, sql`${claims.occurredAt}::date <= ${to}`),
-        )
+        .where(and(sql`${claims.occurredAt}::date >= ${from}`, sql`${claims.occurredAt}::date <= ${to}`))
         .orderBy(asc(claims.occurredAt));
 
       const eventos = await tx
@@ -276,7 +267,7 @@ calendar.get('/', async (req: Request, res: Response, next: NextFunction) => {
         .orderBy(asc(calendarEvents.date), asc(calendarEvents.time));
 
       return {
-        vencimientos: vencimientos.map((v) => ({
+        vencimientos: vencimientos.map(v => ({
           id: v.id,
           date: v.date,
           policyNumber: v.policyNumber,
@@ -284,7 +275,7 @@ calendar.get('/', async (req: Request, res: Response, next: NextFunction) => {
           paymentMethod: paymentLabel(v.paymentMethod),
           client: displayName(v),
         })),
-        cuotas: cuotas.map((c) => ({
+        cuotas: cuotas.map(c => ({
           id: c.id,
           date: c.date,
           number: c.number,
@@ -294,7 +285,7 @@ calendar.get('/', async (req: Request, res: Response, next: NextFunction) => {
           paymentMethod: paymentLabel(c.paymentMethod),
           client: displayName(c),
         })),
-        siniestros: siniestros.map((s) => ({
+        siniestros: siniestros.map(s => ({
           id: s.id,
           date: s.date,
           tipo: CLAIM_TIPO_LABEL[s.tipo] ?? s.tipo,
@@ -303,7 +294,7 @@ calendar.get('/', async (req: Request, res: Response, next: NextFunction) => {
         })),
         // contactName: para precargar el typeahead al editar (Fase 3: el
         // frontend ya no tiene CONTACTS del bootstrap para resolver el id).
-        eventos: eventos.map((r) => ({
+        eventos: eventos.map(r => ({
           ...eventShape(r.e),
           contactName: r.e.contactId ? displayName({ ...r, contactKind: r.contactKind ?? 'PERSONA_FISICA' }) : null,
         })),
@@ -325,7 +316,7 @@ calendar.post('/events', async (req: Request, res: Response, next: NextFunction)
   const input = parsed.data;
   const ctx = req.authCtx!;
   try {
-    const row = await withAuthedTx(ctx, async (tx) => {
+    const row = await withAuthedTx(ctx, async tx => {
       await assertOwned(tx, input);
       const [inserted] = await tx
         .insert(calendarEvents)
@@ -380,7 +371,7 @@ calendar.patch('/events/:id', async (req: Request, res: Response, next: NextFunc
   const input = parsed.data;
   const ctx = req.authCtx!;
   try {
-    const row = await withAuthedTx(ctx, async (tx) => {
+    const row = await withAuthedTx(ctx, async tx => {
       await assertOwned(tx, input);
       const [updated] = await tx
         .update(calendarEvents)
@@ -425,7 +416,7 @@ calendar.delete('/events/:id', async (req: Request, res: Response, next: NextFun
   }
   const ctx = req.authCtx!;
   try {
-    await withAuthedTx(ctx, async (tx) => {
+    await withAuthedTx(ctx, async tx => {
       const [row] = await tx
         .delete(calendarEvents)
         .where(eq(calendarEvents.id, id))
@@ -458,7 +449,7 @@ calendar.post('/events/:id/toggle', async (req: Request, res: Response, next: Ne
   }
   const ctx = req.authCtx!;
   try {
-    const row = await withAuthedTx(ctx, async (tx) => {
+    const row = await withAuthedTx(ctx, async tx => {
       const [updated] = await tx
         .update(calendarEvents)
         .set({

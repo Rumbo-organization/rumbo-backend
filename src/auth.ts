@@ -152,13 +152,16 @@ export const auth = betterAuth({
 
   advanced: {
     // A02/A05 (OWASP): en prod la cookie de sesión va secure + httpOnly.
-    // SPA y API viven en dominios Vercel distintos ⇒ cookie cross-site:
-    // sameSite='none'+secure en prod para que el fetch con credentials la mande.
-    // En local (http) queda 'lax' sin secure (los browsers rechazan None sin secure).
+    // El SPA proxea /api/* a esta API (rewrite en rumbo-frontend/vercel.json),
+    // igual que Vite en dev ⇒ para el browser todo es UN origen (el dominio del
+    // frontend) y la cookie es first-party. sameSite='lax' siempre: sobrevive el
+    // redirect top-level de Google al callback y bloquea CSRF cross-site.
+    // (El esquema anterior de dos dominios + sameSite='none' rompía el login en
+    // iOS: Safari bloquea Set-Cookie third-party y el state de OAuth se perdía.)
     useSecureCookies: IS_PROD,
     defaultCookieAttributes: {
       httpOnly: true,
-      sameSite: IS_PROD ? 'none' : 'lax',
+      sameSite: 'lax',
       secure: IS_PROD,
     },
     database: {

@@ -1,0 +1,25 @@
+# CI de la API: instala y typechequea (npm run build = tsc). Sin lint ni tests
+# configurados todavía; cuando existan (`npm run lint` / `npm test`), agregar
+# los pasos acá. El deploy y su status en el PR los maneja la integración de
+# Vercel.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run build

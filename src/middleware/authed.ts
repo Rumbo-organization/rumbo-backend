@@ -17,11 +17,7 @@ declare global {
 // Middleware de aislamiento multi-tenant (CLAUDE.md §6): resuelve la sesión de
 // Better Auth y deja {userId, orgId} en req.authCtx. Toda ruta /api/v1 pasa por
 // acá; las queries después corren dentro de withAuthedTx (RLS) con ese contexto.
-export async function requireAuthedOrg(
-  req: Request,
-  res: Response,
-  next: NextFunction,
-): Promise<void> {
+export async function requireAuthedOrg(req: Request, res: Response, next: NextFunction): Promise<void> {
   try {
     const s = await auth.api.getSession({
       headers: fromNodeHeaders(req.headers),
@@ -33,18 +29,13 @@ export async function requireAuthedOrg(
 
     // Org activa de la sesión; fallback a la primera membership para sesiones
     // creadas antes del hook (o si el plugin la limpió).
-    const activeOrg =
-      (s.session as { activeOrganizationId?: string | null })
-        .activeOrganizationId ?? null;
+    const activeOrg = (s.session as { activeOrganizationId?: string | null }).activeOrganizationId ?? null;
 
     // Membership del usuario en la org activa (o la primera si no hay activa).
     // Aporta el `role` que gobierna is_org_admin() en las policies RLS.
     const memberWhere = (orgFilter: string | null) =>
       orgFilter
-        ? and(
-            eq(schema.members.userId, s.user.id),
-            eq(schema.members.organizationId, orgFilter),
-          )
+        ? and(eq(schema.members.userId, s.user.id), eq(schema.members.organizationId, orgFilter))
         : eq(schema.members.userId, s.user.id);
     let [member] = await db
       .select({
@@ -82,12 +73,7 @@ export async function requireAuthedOrg(
     const [producer] = await db
       .select({ id: schema.producers.id })
       .from(schema.producers)
-      .where(
-        and(
-          eq(schema.producers.userId, s.user.id),
-          eq(schema.producers.orgId, orgId),
-        ),
-      )
+      .where(and(eq(schema.producers.userId, s.user.id), eq(schema.producers.orgId, orgId)))
       .limit(1);
 
     req.authCtx = {

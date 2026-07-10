@@ -20,7 +20,9 @@ if (IS_PROD && !BETTER_AUTH_SECRET) {
 // En prod SOLO CORS_ORIGIN: dejar localhost habilitado permitiría a cualquier
 // página corriendo en el localhost de un usuario hacer requests con credenciales
 // contra la API productiva (CORS credentials:true + trustedOrigins de Better Auth).
-export const ALLOWED_ORIGINS = Array.from(new Set([
-  process.env.CORS_ORIGIN ?? 'http://localhost:3000',
-  ...(IS_PROD ? [] : ['http://localhost:3000', 'http://127.0.0.1:3000']),
-]));
+export const ALLOWED_ORIGINS = Array.from(
+  new Set([
+    process.env.CORS_ORIGIN ?? 'http://localhost:3000',
+    ...(IS_PROD ? [] : ['http://localhost:3000', 'http://127.0.0.1:3000']),
+  ]),
+);

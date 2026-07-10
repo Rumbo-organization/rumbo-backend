@@ -21,8 +21,16 @@ import { db, schema } from './db/client.js';
 import { sendEmail, type SendEmailInput } from './email.js';
 
 const {
-  calendarEvents, communications, contacts, expiryNotifications, insurers,
-  members, organizations, policies, producers, users,
+  calendarEvents,
+  communications,
+  contacts,
+  expiryNotifications,
+  insurers,
+  members,
+  organizations,
+  policies,
+  producers,
+  users,
 } = schema;
 
 // ── Dominio puro ─────────────────────────────────────────────────────────────
@@ -35,16 +43,31 @@ export const TOLERANCE_DAYS = 2;
 
 // Labels FIELES de los 14 ramos (los emails no colapsan buckets como el BFF).
 const RAMO_LABELS: Record<string, string> = {
-  automotor: 'Automotor', motovehiculo: 'Motovehículo', hogar: 'Hogar', vida: 'Vida',
-  art: 'ART', comercio: 'Comercio', accidentes_personales: 'Accidentes personales',
-  incendio: 'Incendio', responsabilidad_civil: 'Responsabilidad civil', consorcio: 'Consorcio',
-  seguro_tecnico: 'Seguro técnico', transporte: 'Transporte', embarcaciones: 'Embarcaciones', otros: 'Otros',
+  automotor: 'Automotor',
+  motovehiculo: 'Motovehículo',
+  hogar: 'Hogar',
+  vida: 'Vida',
+  art: 'ART',
+  comercio: 'Comercio',
+  accidentes_personales: 'Accidentes personales',
+  incendio: 'Incendio',
+  responsabilidad_civil: 'Responsabilidad civil',
+  consorcio: 'Consorcio',
+  seguro_tecnico: 'Seguro técnico',
+  transporte: 'Transporte',
+  embarcaciones: 'Embarcaciones',
+  otros: 'Otros',
 };
 const PAYMENT_LABELS: Record<string, string> = {
-  cupon: 'Cupón', debito_bancario: 'Débito bancario', tarjeta_credito: 'Tarjeta de crédito',
+  cupon: 'Cupón',
+  debito_bancario: 'Débito bancario',
+  tarjeta_credito: 'Tarjeta de crédito',
 };
 const EVENT_KIND_LABELS: Record<string, string> = {
-  llamada: 'Llamada', reunion: 'Reunión', tramite: 'Trámite', otro: 'Otro',
+  llamada: 'Llamada',
+  reunion: 'Reunión',
+  tramite: 'Trámite',
+  otro: 'Otro',
 };
 
 export function todayAr(): string {
@@ -61,11 +84,17 @@ function formatDateAr(ymd: string): string {
 }
 function primaryEmail(methods: unknown): string | null {
   if (!Array.isArray(methods)) return null;
-  const emails = (methods as Array<{ type?: string; value?: string; primary?: boolean }>)
-    .filter((m) => m.type === 'email' && m.value?.trim());
-  return (emails.find((m) => m.primary) ?? emails[0])?.value?.trim() ?? null;
+  const emails = (methods as Array<{ type?: string; value?: string; primary?: boolean }>).filter(
+    m => m.type === 'email' && m.value?.trim(),
+  );
+  return (emails.find(m => m.primary) ?? emails[0])?.value?.trim() ?? null;
 }
-function displayName(c: { kind: string; firstName: string | null; lastName: string | null; legalName: string | null }): string {
+function displayName(c: {
+  kind: string;
+  firstName: string | null;
+  lastName: string | null;
+  legalName: string | null;
+}): string {
   if (c.kind === 'PERSONA_JURIDICA') return c.legalName ?? '—';
   if (c.lastName && c.firstName) return `${c.lastName}, ${c.firstName}`;
   return c.lastName ?? c.firstName ?? '—';
@@ -73,13 +102,26 @@ function displayName(c: { kind: string; firstName: string | null; lastName: stri
 
 interface DuePolicy {
   window: '30d' | '7d';
-  policyId: string; orgId: string; orgName: string;
-  policyNumber: string | null; ramo: string; endDate: string;
-  contactId: string; contactName: string; contactEmail: string | null;
-  producerId: string | null; producerName: string | null; producerEmail: string | null;
+  policyId: string;
+  orgId: string;
+  orgName: string;
+  policyNumber: string | null;
+  ramo: string;
+  endDate: string;
+  contactId: string;
+  contactName: string;
+  contactEmail: string | null;
+  producerId: string | null;
+  producerName: string | null;
+  producerEmail: string | null;
   paymentMethod: string | null;
 }
-interface AgendaItem { id: string; title: string; time: string | null; kindLabel: string }
+interface AgendaItem {
+  id: string;
+  title: string;
+  time: string | null;
+  kindLabel: string;
+}
 
 function paymentSuffix(pm: string | null): string {
   if (!pm) return '';
@@ -87,31 +129,51 @@ function paymentSuffix(pm: string | null): string {
   return ` | ${PAYMENT_LABELS[pm] ?? pm}`;
 }
 
-export function composeDigest(rows: DuePolicy[], appUrl: string, agenda: AgendaItem[] = []): Pick<SendEmailInput, 'subject' | 'text'> {
+export function composeDigest(
+  rows: DuePolicy[],
+  appUrl: string,
+  agenda: AgendaItem[] = [],
+): Pick<SendEmailInput, 'subject' | 'text'> {
   const n = rows.length;
   const m = agenda.length;
   const policyLines = rows
-    .slice().sort((a, b) => a.endDate.localeCompare(b.endDate))
-    .map((r) => `• ${r.contactName} | ${RAMO_LABELS[r.ramo] ?? r.ramo}${r.policyNumber ? ` ${r.policyNumber}` : ''} | vence el ${formatDateAr(r.endDate)}${paymentSuffix(r.paymentMethod)}`);
+    .slice()
+    .sort((a, b) => a.endDate.localeCompare(b.endDate))
+    .map(
+      r =>
+        `• ${r.contactName} | ${RAMO_LABELS[r.ramo] ?? r.ramo}${r.policyNumber ? ` ${r.policyNumber}` : ''} | vence el ${formatDateAr(r.endDate)}${paymentSuffix(r.paymentMethod)}`,
+    );
   const agendaLines = agenda
-    .slice().sort((a, b) => (a.time ?? '99').localeCompare(b.time ?? '99'))
-    .map((a) => `• ${a.time ? `${a.time.slice(0, 5)} · ` : ''}${a.title} (${a.kindLabel})`);
+    .slice()
+    .sort((a, b) => (a.time ?? '99').localeCompare(b.time ?? '99'))
+    .map(a => `• ${a.time ? `${a.time.slice(0, 5)} · ` : ''}${a.title} (${a.kindLabel})`);
 
   const subject =
-    n > 0 && m > 0 ? `Vencimientos próximos: ${n} ${n === 1 ? 'póliza' : 'pólizas'} · Hoy: ${m} en agenda`
-    : n > 0 ? `Vencimientos próximos: ${n} ${n === 1 ? 'póliza' : 'pólizas'}`
-    : `Tu agenda de hoy: ${m} ${m === 1 ? 'evento' : 'eventos'}`;
+    n > 0 && m > 0
+      ? `Vencimientos próximos: ${n} ${n === 1 ? 'póliza' : 'pólizas'} · Hoy: ${m} en agenda`
+      : n > 0
+        ? `Vencimientos próximos: ${n} ${n === 1 ? 'póliza' : 'pólizas'}`
+        : `Tu agenda de hoy: ${m} ${m === 1 ? 'evento' : 'eventos'}`;
 
   const parts: string[] = [];
   if (m > 0) {
-    parts.push(m === 1 ? 'Tu agenda de hoy (1 evento):' : `Tu agenda de hoy (${m} eventos):`, '', ...agendaLines, '', `Ver el calendario: ${appUrl}/calendario`);
+    parts.push(
+      m === 1 ? 'Tu agenda de hoy (1 evento):' : `Tu agenda de hoy (${m} eventos):`,
+      '',
+      ...agendaLines,
+      '',
+      `Ver el calendario: ${appUrl}/calendario`,
+    );
   }
   if (n > 0) {
     if (m > 0) parts.push('');
     parts.push(
       n === 1 ? 'Tenés 1 póliza por vencer en tu cartera:' : `Tenés ${n} pólizas por vencer en tu cartera:`,
-      '', ...policyLines, '',
-      `Verlas en Rumbo: ${appUrl}/vencimientos`, '',
+      '',
+      ...policyLines,
+      '',
+      `Verlas en Rumbo: ${appUrl}/vencimientos`,
+      '',
       'Las renovaciones se gestionan en el portal de cada compañía.',
     );
   }
@@ -125,13 +187,19 @@ export function composeContactEmail(row: DuePolicy): Pick<SendEmailInput, 'subje
   return {
     subject: `Tu póliza de ${ramoLabel} vence el ${formatDateAr(row.endDate)}`,
     text: [
-      `Hola ${firstName},`, '',
+      `Hola ${firstName},`,
+      '',
       `Te escribo para recordarte que tu póliza${row.policyNumber ? ` ${row.policyNumber}` : ''} de ${ramoLabel} vence el ${formatDateAr(row.endDate)}.`,
       '',
       'Si querés renovarla o revisar la cobertura, respondé este correo y lo coordinamos.',
-      '', 'Saludos,', producer,
+      '',
+      'Saludos,',
+      producer,
       row.orgName !== producer ? row.orgName : '',
-    ].filter((l, i, arr) => !(l === '' && arr[i - 1] === '')).join('\n').trimEnd(),
+    ]
+      .filter((l, i, arr) => !(l === '' && arr[i - 1] === ''))
+      .join('\n')
+      .trimEnd(),
   };
 }
 
@@ -145,12 +213,14 @@ export interface RunExpiryResult {
 
 // ── Job ──────────────────────────────────────────────────────────────────────
 
-export async function runExpiryNotifications(opts: {
-  send?: (email: SendEmailInput) => Promise<void>;
-  today?: string;
-  contactEmailsEnabled?: boolean;
-  appUrl?: string;
-} = {}): Promise<RunExpiryResult> {
+export async function runExpiryNotifications(
+  opts: {
+    send?: (email: SendEmailInput) => Promise<void>;
+    today?: string;
+    contactEmailsEnabled?: boolean;
+    appUrl?: string;
+  } = {},
+): Promise<RunExpiryResult> {
   const send = opts.send ?? sendEmail;
   const today = opts.today ?? todayAr();
   const appUrl = opts.appUrl ?? process.env.APP_PUBLIC_URL ?? process.env.BETTER_AUTH_URL ?? '';
@@ -161,36 +231,56 @@ export async function runExpiryNotifications(opts: {
   for (const { window, days } of EXPIRY_WINDOWS) {
     const rows = await db
       .select({
-        policyId: policies.id, orgId: policies.orgId, orgName: organizations.name,
-        policyNumber: policies.policyNumber, ramo: policies.ramo, endDate: policies.endDate,
+        policyId: policies.id,
+        orgId: policies.orgId,
+        orgName: organizations.name,
+        policyNumber: policies.policyNumber,
+        ramo: policies.ramo,
+        endDate: policies.endDate,
         paymentMethod: policies.paymentMethod,
-        contactId: contacts.id, cKind: contacts.kind, cFirst: contacts.firstName,
-        cLast: contacts.lastName, cLegal: contacts.legalName, contactMethods: contacts.contactMethods,
-        producerId: producers.id, producerName: producers.name,
+        contactId: contacts.id,
+        cKind: contacts.kind,
+        cFirst: contacts.firstName,
+        cLast: contacts.lastName,
+        cLegal: contacts.legalName,
+        contactMethods: contacts.contactMethods,
+        producerId: producers.id,
+        producerName: producers.name,
       })
       .from(policies)
       .innerJoin(contacts, eq(contacts.id, policies.contactId))
       .innerJoin(insurers, eq(insurers.id, policies.insurerId))
       .innerJoin(organizations, eq(organizations.id, policies.orgId))
       .leftJoin(producers, eq(producers.id, policies.producerId))
-      .where(and(
-        eq(policies.status, 'vigente'),
-        gte(policies.endDate, addDays(today, days - TOLERANCE_DAYS)),
-        lte(policies.endDate, addDays(today, days)),
-        notExists(
-          db.select({ one: sql`1` }).from(expiryNotifications)
-            .where(and(eq(expiryNotifications.policyId, policies.id), eq(expiryNotifications.window, window))),
+      .where(
+        and(
+          eq(policies.status, 'vigente'),
+          gte(policies.endDate, addDays(today, days - TOLERANCE_DAYS)),
+          lte(policies.endDate, addDays(today, days)),
+          notExists(
+            db
+              .select({ one: sql`1` })
+              .from(expiryNotifications)
+              .where(and(eq(expiryNotifications.policyId, policies.id), eq(expiryNotifications.window, window))),
+          ),
         ),
-      ));
+      );
     for (const r of rows) {
       if (!r.endDate) continue;
       due.push({
-        window, policyId: r.policyId, orgId: r.orgId, orgName: r.orgName,
-        policyNumber: r.policyNumber, ramo: r.ramo, endDate: r.endDate,
+        window,
+        policyId: r.policyId,
+        orgId: r.orgId,
+        orgName: r.orgName,
+        policyNumber: r.policyNumber,
+        ramo: r.ramo,
+        endDate: r.endDate,
         contactId: r.contactId,
         contactName: displayName({ kind: r.cKind, firstName: r.cFirst, lastName: r.cLast, legalName: r.cLegal }),
         contactEmail: primaryEmail(r.contactMethods),
-        producerId: r.producerId, producerName: r.producerName, producerEmail: null,
+        producerId: r.producerId,
+        producerName: r.producerName,
+        producerEmail: null,
         paymentMethod: r.paymentMethod,
       });
     }
@@ -199,8 +289,12 @@ export async function runExpiryNotifications(opts: {
   // Agenda de HOY (pendientes): mismo digest matinal. Sin dedup propio.
   const todayEvents = await db
     .select({
-      id: calendarEvents.id, title: calendarEvents.title, time: calendarEvents.time,
-      kind: calendarEvents.kind, orgId: calendarEvents.orgId, producerId: calendarEvents.producerId,
+      id: calendarEvents.id,
+      title: calendarEvents.title,
+      time: calendarEvents.time,
+      kind: calendarEvents.kind,
+      orgId: calendarEvents.orgId,
+      producerId: calendarEvents.producerId,
     })
     .from(calendarEvents)
     .where(and(eq(calendarEvents.date, today), isNull(calendarEvents.completedAt)));
@@ -210,13 +304,13 @@ export async function runExpiryNotifications(opts: {
   }
 
   // 2. Destinatarios internos: productores con cuenta + organizador de cada org.
-  const orgIds = [...new Set([...due.map((d) => d.orgId), ...todayEvents.map((e) => e.orgId)])];
+  const orgIds = [...new Set([...due.map(d => d.orgId), ...todayEvents.map(e => e.orgId)])];
   const owners = await db
     .select({ orgId: members.organizationId, email: users.email })
     .from(members)
     .innerJoin(users, eq(users.id, members.userId))
     .where(and(inArray(members.organizationId, orgIds), eq(members.role, 'owner')));
-  const ownerByOrg = new Map(owners.map((o) => [o.orgId, o.email]));
+  const ownerByOrg = new Map(owners.map(o => [o.orgId, o.email]));
 
   const producerRows = await db
     .select({ id: producers.id, orgId: producers.orgId, name: producers.name, email: users.email })
@@ -225,7 +319,7 @@ export async function runExpiryNotifications(opts: {
     .where(inArray(producers.orgId, orgIds));
   // Por id, no por nombre: dos productores homónimos (o un rename) misruteaban
   // el digest con el match `${orgId}:${name}` anterior.
-  const producerEmailById = new Map(producerRows.map((p) => [p.id, p.email]));
+  const producerEmailById = new Map(producerRows.map(p => [p.id, p.email]));
   for (const d of due) {
     d.producerEmail = d.producerId ? (producerEmailById.get(d.producerId) ?? null) : null;
   }
@@ -235,7 +329,7 @@ export async function runExpiryNotifications(opts: {
   const push = (email: string | null, row: DuePolicy) => {
     if (!email) return;
     const list = digests.get(email) ?? [];
-    if (!list.some((x) => x.policyId === row.policyId)) list.push(row);
+    if (!list.some(x => x.policyId === row.policyId)) list.push(row);
     digests.set(email, list);
   };
   for (const d of due) {
@@ -250,7 +344,7 @@ export async function runExpiryNotifications(opts: {
   const pushAgenda = (email: string | null | undefined, e: (typeof todayEvents)[number]) => {
     if (!email) return;
     const list = agendaByEmail.get(email) ?? [];
-    if (!list.some((x) => x.id === e.id)) {
+    if (!list.some(x => x.id === e.id)) {
       list.push({ id: e.id, title: e.title, time: e.time, kindLabel: EVENT_KIND_LABELS[e.kind] ?? e.kind });
     }
     agendaByEmail.set(email, list);
@@ -295,21 +389,26 @@ export async function runExpiryNotifications(opts: {
   }
 
   // 5. Registro al FINAL: dedup + communications de los avisos al asegurado.
-  const delivered = due.filter((d) => !failedPolicyIds.has(d.policyId));
+  const delivered = due.filter(d => !failedPolicyIds.has(d.policyId));
   if (delivered.length > 0) {
     await db.insert(expiryNotifications).values(
-      delivered.map((d) => ({
-        orgId: d.orgId, policyId: d.policyId, window: d.window,
+      delivered.map(d => ({
+        orgId: d.orgId,
+        policyId: d.policyId,
+        window: d.window,
         contactEmail: sentContactEmail.get(d.policyId) ?? null,
       })),
     );
   }
-  const logged = delivered.filter((d) => sentContactEmail.has(d.policyId));
+  const logged = delivered.filter(d => sentContactEmail.has(d.policyId));
   if (logged.length > 0) {
     await db.insert(communications).values(
-      logged.map((d) => ({
-        orgId: d.orgId, contactId: d.contactId, policyId: d.policyId,
-        channel: 'email' as const, templateId: 'vencimiento',
+      logged.map(d => ({
+        orgId: d.orgId,
+        contactId: d.contactId,
+        policyId: d.policyId,
+        channel: 'email' as const,
+        templateId: 'vencimiento',
         body: composeContactEmail(d).text,
       })),
     );

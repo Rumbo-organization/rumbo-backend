@@ -825,8 +825,8 @@ export const policyParties = pgTable(
   ],
 );
 
-// Tipo de relación entre dos contactos (E2, deep-dive §2.21 / O-82). Insurhub
-// las deja SIN tipo (B-44) → grafo plano sin semántica; Rumbo las tipifica
+// Tipo de relación entre dos contactos (E2, deep-dive §2.21 / O-82). La
+// competencia las deja SIN tipo (B-44) → grafo plano sin semántica; Rumbo las tipifica
 // (habilita cross-sell familiar, grupos, segmentación). El par se guarda en UNA
 // fila dirigida (contact_id → related_contact_id), y el lado inverso se deriva
 // (O-83: hijo↔padre_madre, empleado↔empleador; los simétricos se mapean a sí
@@ -922,7 +922,7 @@ export const contactAddresses = pgTable(
 );
 
 // Rol del responsable asignado a un contacto (E2, deep-dive §2.20 / O-79, O-80).
-// "Ejecutivo" en Insurhub; Rumbo lo nombra "Responsable" y permite especializar
+// "Ejecutivo" en la competencia; Rumbo lo nombra "Responsable" y permite especializar
 // (comercial, cobranzas, siniestros). Los permisos derivados (O-81) quedan v0.2.
 export const contactAssigneeRole = pgEnum('contact_assignee_role', [
   'responsable',

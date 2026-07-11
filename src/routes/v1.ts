@@ -4,6 +4,7 @@ import { and, asc, desc, eq, inArray, sql } from 'drizzle-orm';
 import { requireAuthedOrg, requireOwner } from '../middleware/authed.js';
 import { db, withAuthedTx, schema, type AuthedTx } from '../db/client.js';
 import { calendar } from './calendar.js';
+import { intakeLinksRouter, intakesRouter } from './intakes.js';
 import { claimsRouter } from './claims.js';
 import { policyExtras } from './policy-extras.js';
 import { contactExtras } from './contact-extras.js';
@@ -465,6 +466,11 @@ v1.use(requireAuthedOrg);
 // Calendario (jul-2026): month view (4 fuentes derivadas) + CRUD de la agenda.
 // Primer camino de escritura del backend. Hereda requireAuthedOrg de este router.
 v1.use('/calendar', calendar);
+
+// Pre-denuncias (Slice 1): lista/detalle para el cockpit + links públicos por
+// productor. El lado público (submit del asegurado) vive en /api/public.
+v1.use('/intakes', intakesRouter);
+v1.use('/producer-intake-links', intakeLinksRouter);
 
 // Match de nombre del asegurado insensible a acentos: MISMA expresión que el
 // índice trigram de la migración 0005 del monolito viejo (la DB es compartida,

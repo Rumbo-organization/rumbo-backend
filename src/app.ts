@@ -5,6 +5,7 @@ import { toNodeHandler } from 'better-auth/node';
 import { auth } from './auth.js';
 import { pool } from './db.js';
 import { v1 } from './routes/v1.js';
+import { publicIntake } from './routes/public-intake.js';
 import { writeRateLimit } from './middleware/rate-limit.js';
 
 // App Express compartida por los dos entrypoints:
@@ -73,6 +74,11 @@ app.get('/api/cron/expiry-notifications', async (req, res) => {
     res.status(500).json({ error: 'La corrida falló; se reintenta mañana.' });
   }
 });
+
+// Pre-denuncias públicas (Slice 1): el formulario del asegurado, SIN sesión.
+// Rate limit propio y más estricto que v1 (20 POST/min por IP, presupuesto
+// separado por el prefijo); adentro, cliente owner scopeado por slug.
+app.use('/api/public', writeRateLimit(20, 60_000, 'pub'), publicIntake);
 
 // REST v1 (D-026): /bootstrap (BFF del cockpit) + lecturas + escrituras.
 // writeRateLimit acota POST/PATCH/DELETE por IP (A04/A07). Detrás:

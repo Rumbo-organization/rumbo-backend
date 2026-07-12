@@ -8,7 +8,8 @@
 // Reglas duras del doc 17 que este archivo implementa:
 //   1. NUNCA se escribe en contacts/policies: todo lo declarado va al jsonb
 //      del intake; el alta/match real sucede al Convertir (Slice 2).
-//   2. CERO eco de PII: el lookup devuelve solo { matched: boolean }; el match
+//   2. CERO eco de PII: el lookup devuelve { matched } + nombre ENMASCARADO
+//      ("R*** P***", nunca completo, jamás teléfono/email); el match
 //      (contactId/policyId) se guarda para el PAS, jamás se responde al
 //      visitante; los emails al declarante usan SOLO datos declarados.
 //   3. El slug es rotable; acá solo se resuelven links activos.
@@ -271,8 +272,28 @@ publicIntake.get(
   }),
 );
 
-// POST /api/public/pre-denuncia/:slug/lookup — { doc } → { matched }. Solo el
-// booleano: el dato del match queda para el PAS (B-78 de la competencia).
+// Nombre enmascarado para el feedback del lookup ("R*** P***"): suficiente
+// para que el asegurado confirme que lo identificamos bien (y detecte un DNI
+// mal tipeado), inútil para enumerar la cartera. Es el máximo de PII que la
+// superficie pública devuelve (doc 17, regla #2 — nunca nombre completo,
+// teléfono ni email, que es la fuga B-78 de la competencia).
+function maskName(c: {
+  kind: string;
+  firstName: string | null;
+  lastName: string | null;
+  legalName: string | null;
+}): string {
+  const full =
+    c.kind === 'PERSONA_JURIDICA' ? (c.legalName ?? '') : [c.firstName, c.lastName].filter(Boolean).join(' ');
+  return full
+    .split(/\s+/)
+    .filter(Boolean)
+    .map(w => (w.length <= 2 ? `${w[0]}.` : `${w[0]}***`))
+    .join(' ');
+}
+
+// POST /api/public/pre-denuncia/:slug/lookup — { doc } → { matched, nombre? }
+// con el nombre ENMASCARADO. El match real (contactId) queda para el PAS.
 publicIntake.post(
   '/pre-denuncia/:slug/lookup',
   wrap(async (req, res) => {
@@ -291,11 +312,22 @@ publicIntake.post(
       return;
     }
     const [row] = await db
-      .select({ id: contacts.id })
+      .select({
+        id: contacts.id,
+        kind: contacts.kind,
+        firstName: contacts.firstName,
+        lastName: contacts.lastName,
+        legalName: contacts.legalName,
+      })
       .from(contacts)
       .where(and(eq(contacts.orgId, link.orgId), or(eq(contacts.dni, doc), eq(contacts.cuit, doc))))
       .limit(1);
-    res.json({ matched: Boolean(row) });
+    if (!row) {
+      res.json({ matched: false });
+      return;
+    }
+    const nombre = maskName(row);
+    res.json({ matched: true, ...(nombre ? { nombre } : {}) });
   }),
 );
 

@@ -616,6 +616,11 @@ export const claims = pgTable(
       .references(() => policies.id, { onDelete: 'restrict' }),
 
     tipo: claimType('tipo').notNull(),
+    // Tipo específico del catálogo de pre-denuncias ("Accidente in itinere",
+    // "Granizo con pérdida total"): lo que el PAS necesita para la denuncia
+    // formal en el portal. `tipo` queda como bucket grueso para filtros.
+    // Nullable: solo lo setea la conversión de un intake (migración 0006).
+    tipoDetalle: text('tipo_detalle'),
     status: claimStatus('status').notNull().default('abierto'),
     // Priorización del PAS (E4, §2.32). Nullable: los siniestros existentes y los
     // que entran por sync quedan "sin priorizar" hasta que el PAS los clasifique.

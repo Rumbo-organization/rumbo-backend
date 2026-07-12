@@ -1198,6 +1198,117 @@ export const waitlist = pgTable('waitlist', {
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
 
+// ── Pre-denuncias (Slice 1, docs/rumbo/17-pre-denuncias.md) ──────────────────
+//
+// `claim_intakes` es la pre-denuncia que completa el asegurado (o un tercero)
+// en el formulario público, SIN sesión. Todo lo declarado vive acá en jsonb —
+// el form público NUNCA escribe en contacts/policies (regla #1 del doc 17); el
+// alta/match real sucede al Convertir (Slice 2). El endpoint público escribe
+// con el cliente owner scopeado por slug; la app autenticada lee vía RLS
+// (tenant + producer_scope, mismo patrón que calendar_events). DDL + RLS en
+// migrations/0005_claim_intakes.sql.
+
+export const claimIntakeStatus = pgEnum('claim_intake_status', ['pendiente', 'convertida', 'rechazada', 'vencida']);
+
+// Modo del intake: link permanente por productor (A) o link puntual por
+// póliza con token+expiración (B, Slice 4).
+export const claimIntakeMode = pgEnum('claim_intake_mode', ['producer_link', 'policy_link']);
+
+// Link público permanente por productor (Modo A). El slug es un secreto
+// aleatorio ROTABLE — nunca el id interno del productor (B-78/O-183 del
+// deep-dive §13): rotar reemplaza el slug y el link filtrado muere. Una fila
+// por productor (unique).
+export const producerIntakeLinks = pgTable(
+  'producer_intake_links',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    orgId: uuid('org_id')
+      .notNull()
+      .references(() => organizations.id, { onDelete: 'cascade' }),
+    producerId: uuid('producer_id')
+      .notNull()
+      .references(() => producers.id, { onDelete: 'cascade' }),
+    slug: text('slug').notNull().unique(),
+    active: boolean('active').notNull().default(true),
+    rotatedAt: timestamp('rotated_at', { withTimezone: true }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  table => [
+    index('producer_intake_links_org_idx').on(table.orgId),
+    uniqueIndex('producer_intake_links_producer_idx').on(table.producerId),
+  ],
+);
+
+export const claimIntakes = pgTable(
+  'claim_intakes',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    orgId: uuid('org_id')
+      .notNull()
+      .references(() => organizations.id, { onDelete: 'cascade' }),
+    // Cartera a la que entra la pre-denuncia (viene del link). set null:
+    // borrar el productor no borra sus pre-denuncias (las hereda la org).
+    producerId: uuid('producer_id').references(() => producers.id, {
+      onDelete: 'set null',
+    }),
+
+    mode: claimIntakeMode('mode').notNull().default('producer_link'),
+    // Numeración POR ORG (la competencia usa numeración global entre tenants,
+    // B-84 del deep-dive §13). La asigna el insert (max+1) con retry sobre el
+    // unique (org, number).
+    number: integer('number').notNull(),
+    status: claimIntakeStatus('status').notNull().default('pendiente'),
+
+    // Quién completa: { kind: 'asegurado'|'tercero', tercero?: { nombre,
+    // apellido, dni, telefono?, email } }.
+    declarante: jsonb('declarante').$type<Record<string, unknown>>().notNull(),
+    // Identidad DECLARADA del asegurado (no es la ficha): { doc, nombre?,
+    // telefono, email }. Con match, el nombre puede venir vacío.
+    aseguradoDeclarado: jsonb('asegurado_declarado').$type<Record<string, unknown>>().notNull(),
+    // El incidente: { ramo, ramoLabel, tipo, tipoLabel, bucket, fecha, hora,
+    // provincia, localidad, direccion?, bien?, relato }.
+    incidente: jsonb('incidente').$type<Record<string, unknown>>().notNull(),
+
+    // Sugerencias del match silencioso server-side (jamás ecoadas al público).
+    matchedContactId: uuid('matched_contact_id').references(() => contacts.id, {
+      onDelete: 'set null',
+    }),
+    matchedPolicyId: uuid('matched_policy_id').references(() => policies.id, {
+      onDelete: 'set null',
+    }),
+
+    // Adjuntos (Slice 3): [{ key, fileName, contentType, sizeBytes }].
+    attachments: jsonb('attachments').$type<Record<string, unknown>[]>().notNull().default([]),
+
+    // ── Modo B (Slice 4): link puntual por póliza ─────────────────────────────
+    policyId: uuid('policy_id').references(() => policies.id, {
+      onDelete: 'set null',
+    }),
+    tokenHash: text('token_hash'),
+    expiresAt: timestamp('expires_at', { withTimezone: true }),
+
+    // Consentimiento Ley 25.326 (obligatorio en el submit) y envío.
+    consentAt: timestamp('consent_at', { withTimezone: true }).notNull(),
+    submittedAt: timestamp('submitted_at', { withTimezone: true }).notNull().defaultNow(),
+
+    // Resolución (Slice 2): FK al siniestro creado o motivo del rechazo.
+    convertedClaimId: uuid('converted_claim_id').references(() => claims.id, {
+      onDelete: 'set null',
+    }),
+    rejectReason: text('reject_reason'),
+
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  table => [
+    index('claim_intakes_org_idx').on(table.orgId),
+    index('claim_intakes_org_status_idx').on(table.orgId, table.status),
+    index('claim_intakes_producer_idx').on(table.producerId),
+    uniqueIndex('claim_intakes_org_number_idx').on(table.orgId, table.number),
+  ],
+);
+
 // ── Calendario (jul-2026) ────────────────────────────────────────────────────
 //
 // Agenda propia del PAS: llamadas, reuniones, trámites — con vínculo opcional

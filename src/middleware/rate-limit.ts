@@ -17,16 +17,18 @@ interface Bucket {
 }
 const buckets = new Map<string, Bucket>();
 
-export function writeRateLimit(max = 60, windowMs = 60_000) {
+export function writeRateLimit(max = 60, windowMs = 60_000, prefix = 'v1w') {
   return (req: Request, res: Response, next: NextFunction): void => {
     if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') {
       next();
       return;
     }
-    const key = req.ip ?? 'unknown';
+    // El prefijo separa el presupuesto de cada montaje (v1 vs. público):
+    // clavado por IP pura, dos instancias compartirían el mismo bucket.
+    const key = `${prefix}:${req.ip ?? 'unknown'}`;
 
     if (isRedisConfigured()) {
-      incrWindow(`rl:v1w:${key}`, Math.ceil(windowMs / 1000))
+      incrWindow(`rl:${key}`, Math.ceil(windowMs / 1000))
         .then(({ count, ttl }) => {
           if (count > max) {
             res.setHeader('Retry-After', String(Math.max(ttl, 1)));

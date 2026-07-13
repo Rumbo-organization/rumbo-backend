@@ -100,6 +100,18 @@ function displayName(c: {
   if (c.lastName && c.firstName) return `${c.lastName}, ${c.firstName}`;
   return c.lastName ?? c.firstName ?? '—';
 }
+// Para el saludo del email: nombre de pila (jurídicas: razón social completa).
+// No derivar de contactName ("Apellido, Nombre"): partirlo saluda mal a
+// jurídicas ("Hola S.A.") y a contactos con un solo nombre cargado.
+function greetingName(c: {
+  kind: string;
+  firstName: string | null;
+  lastName: string | null;
+  legalName: string | null;
+}): string {
+  if (c.kind === 'PERSONA_JURIDICA') return c.legalName ?? '—';
+  return c.firstName ?? c.lastName ?? '—';
+}
 
 interface DuePolicy {
   window: '30d' | '7d';
@@ -111,6 +123,7 @@ interface DuePolicy {
   endDate: string;
   contactId: string;
   contactName: string;
+  contactFirstName: string;
   contactEmail: string | null;
   producerId: string | null;
   producerName: string | null;
@@ -194,7 +207,7 @@ export function composeDigest(
       '',
       ...agendaLines,
       '',
-      `Ver el calendario: ${appUrl}/calendario`,
+      `Ver el calendario: ${appUrl}/?goto=calendario`,
     );
   }
   if (n > 0) {
@@ -204,7 +217,7 @@ export function composeDigest(
       '',
       ...policyLines,
       '',
-      `Verlas en Rumbo: ${appUrl}/vencimientos`,
+      `Verlas en Rumbo: ${appUrl}/?goto=vencimientos`,
       '',
       'Las renovaciones se gestionan en el portal de cada compañía.',
     );
@@ -213,7 +226,7 @@ export function composeDigest(
 }
 
 export function composeContactEmail(row: DuePolicy): Pick<SendEmailInput, 'subject' | 'text'> {
-  const firstName = row.contactName.split(' ').pop() ?? row.contactName;
+  const firstName = row.contactFirstName;
   const producer = row.producerName ?? row.orgName;
   const ramoLabel = (RAMO_LABELS[row.ramo] ?? row.ramo).toLowerCase();
   return {
@@ -315,6 +328,7 @@ export async function runExpiryNotifications(
         endDate: r.endDate,
         contactId: r.contactId,
         contactName: displayName({ kind: r.cKind, firstName: r.cFirst, lastName: r.cLast, legalName: r.cLegal }),
+        contactFirstName: greetingName({ kind: r.cKind, firstName: r.cFirst, lastName: r.cLast, legalName: r.cLegal }),
         contactEmail: primaryEmail(r.contactMethods),
         producerId: r.producerId,
         producerName: r.producerName,

@@ -1,25 +1,26 @@
-// Endpoints INTERNOS de pre-denuncias (Slice 1, docs/rumbo/17-pre-denuncias.md):
-// lista + detalle para la sección "Pre-denuncias" del cockpit, y gestión de los
-// links públicos por productor (crear + rotar). Heredan requireAuthedOrg del
-// router v1; todas las queries corren bajo withAuthedTx (RLS: tenant +
-// producer_scope — el organizador ve todo, el productor su cartera).
-//
-// Convertir/Rechazar llegan en el Slice 2.
+// Endpoints INTERNOS de pre-denuncias (docs/rumbo/17-pre-denuncias.md):
+// lista + detalle, convertir/rechazar (Slice 2), descarga de adjuntos y link
+// puntual por póliza (Slices 3-4), y gestión de los links públicos por
+// productor (crear + rotar). Heredan requireAuthedOrg del router v1; todas
+// las queries corren bajo withAuthedTx (RLS: tenant + producer_scope — el
+// organizador ve todo, el productor su cartera).
 
 import { Router, type NextFunction, type Request, type Response } from 'express';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { and, desc, eq, or, sql } from 'drizzle-orm';
 
 import { withAuthedTx, schema } from '../db/client.js';
 import { writeAuditLogTx } from '../audit.js';
+import { getObject, isR2Configured } from '../r2.js';
 
-const { claimIntakes, claims, contacts, insurers, policies, producerIntakeLinks, producers } = schema;
+const { claimIntakes, claims, contacts, documents, insurers, policies, producerIntakeLinks, producers } = schema;
 
 const INTAKE_STATUS_LABEL: Record<string, string> = {
   pendiente: 'Pendiente',
   convertida: 'Convertida',
   rechazada: 'Rechazada',
   vencida: 'Vencida',
+  borrador: 'Esperando al cliente',
 };
 
 const isUuid = (s: unknown): s is string =>
@@ -236,6 +237,16 @@ intakesRouter.get(
         matchedPolicyId: r.intake.matchedPolicyId,
         rejectReason: r.intake.rejectReason,
         suggestedPolicies: suggested,
+        // Adjuntos (Slice 3): metadata para listarlos; el binario se baja por
+        // GET /intakes/:id/attachments/:index. La key de R2 no se expone.
+        attachments: (r.intake.attachments ?? []).map((a, ix) => ({
+          index: ix,
+          fileName: (a as Record<string, unknown>).fileName ?? 'adjunto',
+          sizeBytes: (a as Record<string, unknown>).sizeBytes ?? 0,
+          slot: (a as Record<string, unknown>).slot ?? null,
+        })),
+        // Modo B: vencimiento del link (visible para el PAS en borradores).
+        expiresAt: r.intake.expiresAt ? r.intake.expiresAt.toISOString() : null,
       };
     });
     if (!out) {
@@ -243,6 +254,112 @@ intakesRouter.get(
       return;
     }
     res.json(out);
+  }),
+);
+
+// ── Adjuntos y Modo B (Slices 3-4) ───────────────────────────────────────────
+
+const sha256 = (s: string) => createHash('sha256').update(s).digest('hex');
+
+// GET /api/v1/intakes/:id/attachments/:index — descarga autenticada de un
+// adjunto del intake (RLS scopea; patrón download de documents.ts).
+intakesRouter.get(
+  '/:id/attachments/:index',
+  wrap(async (req, res) => {
+    const id = req.params.id;
+    const index = parseInt(String(req.params.index ?? ''), 10);
+    if (!isUuid(id) || !Number.isInteger(index) || index < 0 || index > 7) {
+      res.status(400).json({ error: 'Adjunto inválido.' });
+      return;
+    }
+    if (!isR2Configured()) {
+      res.status(503).json({ error: 'El almacenamiento de adjuntos no está configurado todavía.' });
+      return;
+    }
+    const att = await withAuthedTx(req.authCtx!, async tx => {
+      const [row] = await tx
+        .select({ attachments: claimIntakes.attachments })
+        .from(claimIntakes)
+        .where(eq(claimIntakes.id, id))
+        .limit(1);
+      return (row?.attachments?.[index] as Record<string, unknown> | undefined) ?? null;
+    });
+    if (!att || typeof att.key !== 'string') {
+      res.status(404).json({ error: 'Adjunto no encontrado.' });
+      return;
+    }
+    const obj = await getObject(att.key);
+    res.setHeader('Content-Type', String(att.contentType ?? 'application/octet-stream'));
+    res.setHeader(
+      'Content-Disposition',
+      `inline; filename="${String(att.fileName ?? 'adjunto').replace(/[^\w. -]/g, '_')}"`,
+    );
+    res.send(Buffer.from(await obj.arrayBuffer()));
+  }),
+);
+
+// POST /api/v1/intakes/policy-link { policyId } — Modo B: crea el intake
+// `borrador` y devuelve el token PLANO (solo se ve acá; en DB queda el hash).
+// El link /d/{token} es privado: se lo manda el PAS al titular y trae prefill.
+intakesRouter.post(
+  '/policy-link',
+  wrap(async (req, res) => {
+    const policyId = (req.body as Record<string, unknown> | undefined)?.policyId;
+    if (!isUuid(policyId)) {
+      res.status(400).json({ error: 'Póliza inválida.' });
+      return;
+    }
+    const ctx = req.authCtx!;
+    const token = randomBytes(24).toString('base64url');
+    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+
+    const out = await withAuthedTx(ctx, async tx => {
+      const [policy] = await tx
+        .select({ id: policies.id, producerId: policies.producerId })
+        .from(policies)
+        .where(eq(policies.id, policyId))
+        .limit(1);
+      if (!policy) return null;
+
+      let row: { id: string } | undefined;
+      for (let attempt = 0; attempt < 3 && !row; attempt++) {
+        try {
+          [row] = await tx
+            .insert(claimIntakes)
+            .values({
+              orgId: ctx.orgId,
+              producerId: policy.producerId ?? ctx.producerId,
+              mode: 'policy_link',
+              number: sql`(select coalesce(max(${claimIntakes.number}), 0) + 1 from ${claimIntakes} where ${claimIntakes.orgId} = ${ctx.orgId})`,
+              status: 'borrador',
+              declarante: {},
+              aseguradoDeclarado: {},
+              incidente: {},
+              policyId: policy.id,
+              tokenHash: sha256(token),
+              expiresAt,
+            })
+            .returning({ id: claimIntakes.id });
+        } catch (err) {
+          if ((err as { code?: string }).code !== '23505' || attempt === 2) throw err;
+        }
+      }
+      if (!row) throw new Error('policy-link: el insert no devolvió fila');
+      await writeAuditLogTx(tx, {
+        orgId: ctx.orgId,
+        userId: ctx.userId,
+        action: 'create_policy_intake_link',
+        entityType: 'claim_intake',
+        entityId: row.id,
+        payload: { policyId: policy.id },
+      });
+      return row;
+    });
+    if (!out) {
+      res.status(404).json({ error: 'Póliza no encontrada.' });
+      return;
+    }
+    res.status(201).json({ token, expiresAt: expiresAt.toISOString() });
   }),
 );
 
@@ -318,6 +435,22 @@ intakesRouter.post(
         })
         .returning({ id: claims.id });
       if (!claim) throw new Error('convertir intake: el insert del siniestro no devolvió fila');
+
+      // Promoción de adjuntos (Slice 3): una fila de `documents` por adjunto,
+      // colgada del siniestro. El binario NO se copia — misma key de R2.
+      const atts = (intake.attachments ?? []) as Record<string, unknown>[];
+      for (const a of atts) {
+        if (typeof a.key !== 'string') continue;
+        await tx.insert(documents).values({
+          orgId: ctx.orgId,
+          claimId: claim.id,
+          fileName: String(a.fileName ?? 'adjunto'),
+          contentType: String(a.contentType ?? 'application/octet-stream'),
+          sizeBytes: Number(a.sizeBytes ?? 0),
+          storageKey: a.key,
+          uploadedByUserId: ctx.userId,
+        });
+      }
 
       await tx
         .update(claimIntakes)

@@ -1090,6 +1090,11 @@ export const documents = pgTable(
     contactId: uuid('contact_id').references(() => contacts.id, {
       onDelete: 'cascade',
     }),
+    // Tercer target (Slice 3 de pre-denuncias, migración 0007): adjuntos del
+    // siniestro — los promueve la conversión del intake.
+    claimId: uuid('claim_id').references(() => claims.id, {
+      onDelete: 'cascade',
+    }),
 
     fileName: text('file_name').notNull(),
     contentType: text('content_type').notNull(),
@@ -1106,8 +1111,12 @@ export const documents = pgTable(
     index('documents_org_idx').on(table.orgId),
     index('documents_policy_idx').on(table.policyId),
     index('documents_contact_idx').on(table.contactId),
-    // Cuelga de exactamente uno: póliza XOR contacto.
-    check('documents_target_chk', sql`(${table.policyId} IS NOT NULL) <> (${table.contactId} IS NOT NULL)`),
+    index('documents_claim_idx').on(table.claimId),
+    // Cuelga de exactamente uno: póliza XOR contacto XOR siniestro.
+    check(
+      'documents_target_chk',
+      sql`((${table.policyId} IS NOT NULL)::int + (${table.contactId} IS NOT NULL)::int + (${table.claimId} IS NOT NULL)::int) = 1`,
+    ),
   ],
 );
 
@@ -1213,7 +1222,16 @@ export const waitlist = pgTable('waitlist', {
 // (tenant + producer_scope, mismo patrón que calendar_events). DDL + RLS en
 // migrations/0005_claim_intakes.sql.
 
-export const claimIntakeStatus = pgEnum('claim_intake_status', ['pendiente', 'convertida', 'rechazada', 'vencida']);
+// `borrador` (Modo B, migración 0007): la fila nace al generar el link por
+// póliza y el submit del asegurado la completa (→ pendiente). `vencida` = el
+// borrador expiró sin envío (lo marca el cron diario).
+export const claimIntakeStatus = pgEnum('claim_intake_status', [
+  'pendiente',
+  'convertida',
+  'rechazada',
+  'vencida',
+  'borrador',
+]);
 
 // Modo del intake: link permanente por productor (A) o link puntual por
 // póliza con token+expiración (B, Slice 4).
@@ -1293,8 +1311,13 @@ export const claimIntakes = pgTable(
     tokenHash: text('token_hash'),
     expiresAt: timestamp('expires_at', { withTimezone: true }),
 
-    // Consentimiento Ley 25.326 (obligatorio en el submit) y envío.
-    consentAt: timestamp('consent_at', { withTimezone: true }).notNull(),
+    // Consentimiento Ley 25.326 (obligatorio en el submit; null solo en
+    // borradores de Modo B — migración 0007) y envío.
+    consentAt: timestamp('consent_at', { withTimezone: true }),
+    // Token de subida de adjuntos (Slice 3): sha256 del token que devuelve el
+    // submit; habilita POST /api/public/pre-denuncia/attachments/:intakeId
+    // por una ventana acotada.
+    uploadTokenHash: text('upload_token_hash'),
     submittedAt: timestamp('submitted_at', { withTimezone: true }).notNull().defaultNow(),
 
     // Resolución (Slice 2): FK al siniestro creado o motivo del rechazo.

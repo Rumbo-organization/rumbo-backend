@@ -17,7 +17,7 @@ import { asc, eq } from 'drizzle-orm';
 import { withAuthedTx, schema, type AuthedTx } from '../db/client.js';
 import { writeAuditLogTx } from '../audit.js';
 
-const { claims, claimEvents, contacts, insurers, policies, users } = schema;
+const { claims, claimEvents, contacts, documents, insurers, policies, users } = schema;
 
 // ── Etiquetas (mismo criterio que routes/v1.ts) ──────────────────────────────
 const CLAIM_TYPES = [
@@ -188,12 +188,21 @@ claimsRouter.get('/:id', async (req: Request, res: Response, next: NextFunction)
         .where(eq(claimEvents.claimId, id))
         .orderBy(asc(claimEvents.createdAt));
 
+      // Adjuntos del siniestro (Slice 3 de pre-denuncias): los promueve la
+      // conversión del intake; se descargan por /api/v1/documents/:id.
+      const docRows = await tx
+        .select({ id: documents.id, fileName: documents.fileName, sizeBytes: documents.sizeBytes })
+        .from(documents)
+        .where(eq(documents.claimId, id))
+        .orderBy(asc(documents.createdAt));
+
       const c = row.c;
       const staleDays = Math.max(0, Math.round((now.getTime() - c.lastActivityAt.getTime()) / 86400000));
       return {
         id: c.id,
         num: c.claimNumber ?? '—',
         tipo: CLAIM_TYPE_LABEL[c.tipo] ?? c.tipo,
+        tipoDetalle: c.tipoDetalle,
         status: CLAIM_STATUS_LABEL[c.status] ?? c.status,
         importance: c.importance ? (CLAIM_IMPORTANCE_LABEL[c.importance] ?? c.importance) : null,
         client: displayName(row),
@@ -205,6 +214,7 @@ claimsRouter.get('/:id', async (req: Request, res: Response, next: NextFunction)
         location: c.location,
         description: c.description,
         stale: staleDays,
+        documentos: docRows,
         events: evRows.map(({ e, who }) => ({
           id: e.id,
           when: relativeSince(e.createdAt, now),

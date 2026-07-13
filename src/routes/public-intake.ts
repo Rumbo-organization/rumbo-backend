@@ -18,13 +18,17 @@
 // (payload mínimo). Validación hand-rolled como routes/calendar.ts.
 
 import { Router, type NextFunction, type Request, type Response } from 'express';
-import { and, eq, or, sql } from 'drizzle-orm';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { and, eq, gt, or, sql } from 'drizzle-orm';
+import multer from 'multer';
 
 import { db, schema } from '../db/client.js';
 import { sendEmail } from '../email.js';
+import { isR2Configured, putObject } from '../r2.js';
 import { INTAKE_CATALOG, findRamo, findTipo } from '../lib/claim-intake-catalog.js';
 
-const { claimIntakes, contacts, members, organizations, policyRisks, producerIntakeLinks, producers, users } = schema;
+const { claimIntakes, contacts, members, organizations, policies, policyRisks, producerIntakeLinks, producers, users } =
+  schema;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -71,6 +75,102 @@ async function resolveLink(slug: string): Promise<LinkCtx | null> {
     .limit(1);
   return row ?? null;
 }
+
+const sha256 = (s: string) => createHash('sha256').update(s).digest('hex');
+
+// ── Modo B: link puntual por póliza (Slice 4) ────────────────────────────────
+//
+// El token (secreto, hasheado en DB) apunta a un intake `borrador` creado al
+// generar el link desde la póliza. Este link es PRIVADO (se lo mandó el PAS al
+// titular), así que el prefill completo es legítimo — a diferencia del link
+// por productor, que es público y no ecoa PII.
+
+interface TokenCtx {
+  intake: typeof claimIntakes.$inferSelect;
+  link: LinkCtx;
+  policyNumber: string | null;
+  policyRamo: string | null;
+  contactId: string | null;
+  contact: {
+    kind: string;
+    firstName: string | null;
+    lastName: string | null;
+    legalName: string | null;
+    dni: string | null;
+    cuit: string | null;
+    contactMethods: unknown;
+  } | null;
+}
+
+async function resolveToken(raw: string): Promise<TokenCtx | null> {
+  const hash = sha256(raw);
+  const [row] = await db
+    .select({
+      intake: claimIntakes,
+      orgName: organizations.name,
+      producerName: producers.name,
+      policyNumber: policies.policyNumber,
+      policyRamo: policies.ramo,
+      contactId: policies.contactId,
+      cKind: contacts.kind,
+      cFirst: contacts.firstName,
+      cLast: contacts.lastName,
+      cLegal: contacts.legalName,
+      cDni: contacts.dni,
+      cCuit: contacts.cuit,
+      cMethods: contacts.contactMethods,
+    })
+    .from(claimIntakes)
+    .innerJoin(organizations, eq(organizations.id, claimIntakes.orgId))
+    .leftJoin(producers, eq(producers.id, claimIntakes.producerId))
+    .leftJoin(policies, eq(policies.id, claimIntakes.policyId))
+    .leftJoin(contacts, eq(contacts.id, policies.contactId))
+    .where(and(eq(claimIntakes.tokenHash, hash), eq(claimIntakes.mode, 'policy_link')))
+    .limit(1);
+  if (!row) return null;
+  return {
+    intake: row.intake,
+    link: {
+      orgId: row.intake.orgId,
+      orgName: row.orgName,
+      producerId: row.intake.producerId ?? '',
+      producerName: row.producerName ?? row.orgName,
+    },
+    policyNumber: row.policyNumber,
+    policyRamo: row.policyRamo,
+    contactId: row.contactId,
+    contact: row.cKind
+      ? {
+          kind: row.cKind,
+          firstName: row.cFirst,
+          lastName: row.cLast,
+          legalName: row.cLegal,
+          dni: row.cDni,
+          cuit: row.cCuit,
+          contactMethods: row.cMethods,
+        }
+      : null,
+  };
+}
+
+// Display completo del titular (para el prefill del Modo B; misma lógica que
+// routes/v1.ts).
+function fullName(c: { kind: string; firstName: string | null; lastName: string | null; legalName: string | null }) {
+  if (c.kind === 'PERSONA_JURIDICA') return c.legalName ?? '';
+  if (c.lastName && c.firstName) return `${c.lastName}, ${c.firstName}`;
+  return c.lastName ?? c.firstName ?? '';
+}
+
+function methodValue(methods: unknown, type: string): string | null {
+  if (!Array.isArray(methods)) return null;
+  const rows = (methods as Array<{ type?: string; value?: string; primary?: boolean }>).filter(
+    m => m.value?.trim() && (type === 'phone' ? m.type !== 'email' : m.type === 'email'),
+  );
+  return (rows.find(m => m.primary) ?? rows[0])?.value?.trim() ?? null;
+}
+
+const tokenVigente = (i: typeof claimIntakes.$inferSelect) =>
+  i.status === 'borrador' && i.expiresAt !== null && i.expiresAt > new Date();
 
 // ── Validación del submit ────────────────────────────────────────────────────
 
@@ -246,7 +346,17 @@ const wrap =
     }
   };
 
-// GET /api/public/pre-denuncia/:slug — branding mínimo + catálogo. Nunca PII.
+const publicCatalog = (only?: string | null) =>
+  INTAKE_CATALOG.filter(r => !only || r.code === only).map(r => ({
+    code: r.code,
+    label: r.label,
+    publicLabel: r.publicLabel,
+    tipos: r.tipos.map(t => ({ code: t.code, label: t.label })),
+  }));
+
+// GET /api/public/pre-denuncia/:slug — resolución DUAL: link por productor
+// (Modo A: branding + catálogo, nunca PII) o token por póliza (Modo B:
+// catálogo del ramo + prefill completo del titular — el link es privado).
 publicIntake.get(
   '/pre-denuncia/:slug',
   wrap(async (req, res) => {
@@ -255,19 +365,54 @@ publicIntake.get(
       return;
     }
     const link = await resolveLink(req.params.slug);
-    if (!link) {
+    if (link) {
+      res.json({
+        mode: 'producer_link',
+        producer: link.producerName,
+        org: link.orgName,
+        catalog: publicCatalog(),
+      });
+      return;
+    }
+
+    const tok = await resolveToken(req.params.slug);
+    if (!tok) {
       res.status(404).json({ error: 'Link inválido o vencido.' });
       return;
     }
+    if (tok.intake.status !== 'borrador') {
+      res.status(410).json({ error: 'Esta pre-denuncia ya fue enviada. Tu productor la está gestionando.' });
+      return;
+    }
+    if (!tokenVigente(tok.intake)) {
+      res.status(404).json({ error: 'Link inválido o vencido.' });
+      return;
+    }
+    // Patente del riesgo de la póliza (si hay), para prefill del bien.
+    let patente: string | null = null;
+    if (tok.intake.policyId) {
+      const [risk] = await db
+        .select({ patente: policyRisks.patente })
+        .from(policyRisks)
+        .where(eq(policyRisks.policyId, tok.intake.policyId))
+        .limit(1);
+      patente = risk?.patente ?? null;
+    }
+    const ramoCode = findRamo(tok.policyRamo)?.code ?? null;
     res.json({
-      producer: link.producerName,
-      org: link.orgName,
-      catalog: INTAKE_CATALOG.map(r => ({
-        code: r.code,
-        label: r.label,
-        publicLabel: r.publicLabel,
-        tipos: r.tipos.map(t => ({ code: t.code, label: t.label })),
-      })),
+      mode: 'policy_link',
+      producer: tok.link.producerName,
+      org: tok.link.orgName,
+      catalog: publicCatalog(ramoCode),
+      prefill: {
+        nombre: tok.contact ? fullName(tok.contact) : '',
+        doc: tok.contact?.dni ?? tok.contact?.cuit ?? '',
+        telefono: tok.contact ? (methodValue(tok.contact.contactMethods, 'phone') ?? '') : '',
+        email: tok.contact ? (methodValue(tok.contact.contactMethods, 'email') ?? '') : '',
+        ramo: ramoCode,
+        bien: patente ?? '',
+        policyNumber: tok.policyNumber,
+      },
     });
   }),
 );
@@ -331,9 +476,11 @@ publicIntake.post(
   }),
 );
 
-// POST /api/public/pre-denuncia/:slug — el submit. Crea el intake (owner, con
-// numeración por org y retry sobre el unique), matchea en silencio y dispara
-// los dos emails (resilientes: un email caído no pierde la pre-denuncia).
+// POST /api/public/pre-denuncia/:slug — el submit, DUAL como el GET.
+// Modo A (link por productor): INSERT con numeración por org y match
+// silencioso. Modo B (token por póliza): UPDATE del borrador (match conocido:
+// el titular y la póliza del link). En ambos: dos emails resilientes y un
+// uploadToken para subir adjuntos (Slice 3).
 publicIntake.post(
   '/pre-denuncia/:slug',
   wrap(async (req, res) => {
@@ -342,10 +489,20 @@ publicIntake.post(
       return;
     }
     const link = await resolveLink(req.params.slug);
-    if (!link) {
+    const tok = link ? null : await resolveToken(req.params.slug);
+    if (!link && !tok) {
       res.status(404).json({ error: 'Link inválido o vencido.' });
       return;
     }
+    if (tok && tok.intake.status !== 'borrador') {
+      res.status(410).json({ error: 'Esta pre-denuncia ya fue enviada.' });
+      return;
+    }
+    if (tok && !tokenVigente(tok.intake)) {
+      res.status(404).json({ error: 'Link inválido o vencido.' });
+      return;
+    }
+
     const parsed = parseSubmit(req.body);
     if ('error' in parsed) {
       res.status(400).json({ error: parsed.error });
@@ -353,72 +510,118 @@ publicIntake.post(
     }
     const { data } = parsed;
 
-    // Match silencioso: contacto por documento declarado.
-    const doc = data.aseguradoDeclarado.doc as string;
-    const [contact] = await db
-      .select({ id: contacts.id })
-      .from(contacts)
-      .where(and(eq(contacts.orgId, link.orgId), or(eq(contacts.dni, doc), eq(contacts.cuit, doc))))
-      .limit(1);
-    // Sin match y sin nombre declarado no hay forma de identificar a la persona.
-    if (!contact && !data.aseguradoDeclarado.nombre) {
-      res.status(400).json({ error: 'Completá el nombre del asegurado.' });
-      return;
-    }
+    const uploadToken = randomBytes(24).toString('base64url');
+    const uploadTokenHash = sha256(uploadToken);
 
-    // Match silencioso: póliza por patente/bien (normalizado alfanumérico).
-    let matchedPolicyId: string | null = null;
-    let matchedPolicyNumber: string | null = null;
-    const bienNorm = ((data.incidente.bien as string) ?? '').replace(/[^A-Za-z0-9]/g, '').toUpperCase();
-    if (bienNorm.length >= 5 && bienNorm.length <= 10) {
-      const [risk] = await db
-        .select({ policyId: policyRisks.policyId })
-        .from(policyRisks)
-        .where(
-          and(
-            eq(policyRisks.orgId, link.orgId),
-            sql`upper(regexp_replace(coalesce(${policyRisks.patente}, ''), '[^A-Za-z0-9]', '', 'g')) = ${bienNorm}`,
-          ),
-        )
-        .limit(1);
-      if (risk) {
-        matchedPolicyId = risk.policyId;
-        const [pol] = await db
-          .select({ policyNumber: schema.policies.policyNumber })
-          .from(schema.policies)
-          .where(eq(schema.policies.id, risk.policyId))
-          .limit(1);
-        matchedPolicyNumber = pol?.policyNumber ?? null;
-      }
-    }
-
-    // Insert con numeración por org: max+1 en el mismo statement; ante la
-    // carrera (unique org+number) se reintenta.
+    let linkCtx: LinkCtx;
     let number = 0;
     let intakeId: string | null = null;
-    for (let attempt = 0; attempt < 3 && !intakeId; attempt++) {
-      try {
-        const [row] = await db
-          .insert(claimIntakes)
-          .values({
-            orgId: link.orgId,
-            producerId: link.producerId,
-            mode: 'producer_link',
-            number: sql`(select coalesce(max(${claimIntakes.number}), 0) + 1 from ${claimIntakes} where ${claimIntakes.orgId} = ${link.orgId})`,
-            declarante: data.declarante,
-            aseguradoDeclarado: data.aseguradoDeclarado,
-            incidente: data.incidente,
-            matchedContactId: contact?.id ?? null,
-            matchedPolicyId,
-            consentAt: new Date(),
-          })
-          .returning({ id: claimIntakes.id, number: claimIntakes.number });
-        if (row) {
-          intakeId = row.id;
-          number = row.number;
+    let contactMatched = false;
+    let matchedPolicyNumber: string | null = null;
+
+    if (tok) {
+      // ── Modo B: completar el borrador ──────────────────────────────────────
+      linkCtx = tok.link;
+      contactMatched = Boolean(tok.contactId);
+      matchedPolicyNumber = tok.policyNumber;
+      const [row] = await db
+        .update(claimIntakes)
+        .set({
+          declarante: data.declarante,
+          aseguradoDeclarado: data.aseguradoDeclarado,
+          incidente: data.incidente,
+          matchedContactId: tok.contactId,
+          matchedPolicyId: tok.intake.policyId,
+          status: 'pendiente',
+          consentAt: new Date(),
+          submittedAt: new Date(),
+          uploadTokenHash,
+          updatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(claimIntakes.id, tok.intake.id),
+            eq(claimIntakes.status, 'borrador'),
+            gt(claimIntakes.expiresAt, new Date()),
+          ),
+        )
+        .returning({ id: claimIntakes.id, number: claimIntakes.number });
+      if (!row) {
+        res.status(404).json({ error: 'Link inválido o vencido.' });
+        return;
+      }
+      intakeId = row.id;
+      number = row.number;
+    } else {
+      // ── Modo A: alta nueva con match silencioso ────────────────────────────
+      linkCtx = link!;
+
+      // Contacto por documento declarado.
+      const doc = data.aseguradoDeclarado.doc as string;
+      const [contact] = await db
+        .select({ id: contacts.id })
+        .from(contacts)
+        .where(and(eq(contacts.orgId, linkCtx.orgId), or(eq(contacts.dni, doc), eq(contacts.cuit, doc))))
+        .limit(1);
+      // Sin match y sin nombre declarado no hay forma de identificar a la persona.
+      if (!contact && !data.aseguradoDeclarado.nombre) {
+        res.status(400).json({ error: 'Completá el nombre del asegurado.' });
+        return;
+      }
+      contactMatched = Boolean(contact);
+
+      // Póliza por patente/bien (normalizado alfanumérico).
+      let matchedPolicyId: string | null = null;
+      const bienNorm = ((data.incidente.bien as string) ?? '').replace(/[^A-Za-z0-9]/g, '').toUpperCase();
+      if (bienNorm.length >= 5 && bienNorm.length <= 10) {
+        const [risk] = await db
+          .select({ policyId: policyRisks.policyId })
+          .from(policyRisks)
+          .where(
+            and(
+              eq(policyRisks.orgId, linkCtx.orgId),
+              sql`upper(regexp_replace(coalesce(${policyRisks.patente}, ''), '[^A-Za-z0-9]', '', 'g')) = ${bienNorm}`,
+            ),
+          )
+          .limit(1);
+        if (risk) {
+          matchedPolicyId = risk.policyId;
+          const [pol] = await db
+            .select({ policyNumber: policies.policyNumber })
+            .from(policies)
+            .where(eq(policies.id, risk.policyId))
+            .limit(1);
+          matchedPolicyNumber = pol?.policyNumber ?? null;
         }
-      } catch (err) {
-        if ((err as { code?: string }).code !== '23505' || attempt === 2) throw err;
+      }
+
+      // Insert con numeración por org: max+1 en el mismo statement; ante la
+      // carrera (unique org+number) se reintenta.
+      for (let attempt = 0; attempt < 3 && !intakeId; attempt++) {
+        try {
+          const [row] = await db
+            .insert(claimIntakes)
+            .values({
+              orgId: linkCtx.orgId,
+              producerId: linkCtx.producerId,
+              mode: 'producer_link',
+              number: sql`(select coalesce(max(${claimIntakes.number}), 0) + 1 from ${claimIntakes} where ${claimIntakes.orgId} = ${linkCtx.orgId})`,
+              declarante: data.declarante,
+              aseguradoDeclarado: data.aseguradoDeclarado,
+              incidente: data.incidente,
+              matchedContactId: contact?.id ?? null,
+              matchedPolicyId,
+              consentAt: new Date(),
+              uploadTokenHash,
+            })
+            .returning({ id: claimIntakes.id, number: claimIntakes.number });
+          if (row) {
+            intakeId = row.id;
+            number = row.number;
+          }
+        } catch (err) {
+          if ((err as { code?: string }).code !== '23505' || attempt === 2) throw err;
+        }
       }
     }
     if (!intakeId) {
@@ -431,20 +634,20 @@ publicIntake.post(
       .select({ email: users.email })
       .from(producers)
       .innerJoin(users, eq(users.id, producers.userId))
-      .where(eq(producers.id, link.producerId))
+      .where(eq(producers.id, linkCtx.producerId))
       .limit(1);
     const [owner] = await db
       .select({ email: users.email })
       .from(members)
       .innerJoin(users, eq(users.id, members.userId))
-      .where(and(eq(members.organizationId, link.orgId), eq(members.role, 'owner')))
+      .where(and(eq(members.organizationId, linkCtx.orgId), eq(members.role, 'owner')))
       .limit(1);
 
     const mailCtx: IntakeMailCtx = {
       number,
-      link,
+      link: linkCtx,
       data,
-      matchedContact: Boolean(contact),
+      matchedContact: contactMatched,
       matchedPolicyNumber,
     };
     const appUrl = process.env.APP_PUBLIC_URL ?? process.env.BETTER_AUTH_URL ?? '';
@@ -470,6 +673,101 @@ publicIntake.post(
       }
     }
 
-    res.status(201).json({ number });
+    // intakeId + uploadToken habilitan la subida de adjuntos (Slice 3): el id
+    // solo sirve junto con el token (hasheado en la fila) y por 1 hora.
+    res.status(201).json({ number, intakeId, uploadToken });
+  }),
+);
+
+// ── Adjuntos (Slice 3) ───────────────────────────────────────────────────────
+//
+// Un archivo por request (Vercel capea el body en ~4.5 MB; el form comprime
+// las imágenes client-side). Autoriza el uploadToken del submit, por una
+// ventana de 1 hora y hasta 8 adjuntos. El binario va a R2 bajo key propia del
+// intake; la metadata queda en el jsonb `attachments` (append atómico) hasta
+// que la conversión la promueva a `documents`.
+
+const ATTACHMENT_MAX_BYTES = 4 * 1024 * 1024; // techo real de Vercel ~4.5 MB
+const ATTACHMENT_ALLOWED = new Set(['application/pdf', 'image/png', 'image/jpeg', 'image/webp']);
+const ATTACHMENT_WINDOW_MS = 60 * 60 * 1000;
+const attachmentUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: ATTACHMENT_MAX_BYTES } });
+
+publicIntake.post(
+  '/pre-denuncia/attachments/:intakeId',
+  attachmentUpload.single('file'),
+  wrap(async (req, res) => {
+    if (!isR2Configured()) {
+      res.status(503).json({ error: 'El almacenamiento de adjuntos no está configurado todavía.' });
+      return;
+    }
+    const intakeId = String(req.params.intakeId ?? '');
+    const idOk = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(intakeId);
+    const token = typeof req.body?.token === 'string' ? req.body.token : '';
+    if (!idOk || !isSlug(token)) {
+      res.status(404).json({ error: 'Subida no autorizada.' });
+      return;
+    }
+    const file = req.file;
+    if (!file || file.size === 0) {
+      res.status(400).json({ error: 'Falta el archivo.' });
+      return;
+    }
+    const contentType = file.mimetype || 'application/octet-stream';
+    if (!ATTACHMENT_ALLOWED.has(contentType)) {
+      res.status(400).json({ error: 'Formato no permitido (foto o PDF).' });
+      return;
+    }
+    const slot = str(req.body?.slot, 60) ?? 'Adjunto';
+
+    const [intake] = await db
+      .select({
+        orgId: claimIntakes.orgId,
+        status: claimIntakes.status,
+        submittedAt: claimIntakes.submittedAt,
+        uploadTokenHash: claimIntakes.uploadTokenHash,
+        attachments: claimIntakes.attachments,
+      })
+      .from(claimIntakes)
+      .where(eq(claimIntakes.id, intakeId))
+      .limit(1);
+    if (
+      !intake ||
+      intake.status !== 'pendiente' ||
+      !intake.uploadTokenHash ||
+      intake.uploadTokenHash !== sha256(token) ||
+      Date.now() - intake.submittedAt.getTime() > ATTACHMENT_WINDOW_MS ||
+      (intake.attachments?.length ?? 0) >= 8
+    ) {
+      res.status(404).json({ error: 'Subida no autorizada.' });
+      return;
+    }
+
+    const key = `${intake.orgId}/intake/${intakeId}/${randomUUID()}`;
+    await putObject(key, new Uint8Array(file.buffer), contentType);
+
+    const meta = {
+      key,
+      fileName: file.originalname || 'adjunto',
+      contentType,
+      sizeBytes: file.size,
+      slot,
+    };
+    // Append atómico con re-chequeo del tope (dos subidas en paralelo no lo pisan).
+    const updated = await db
+      .update(claimIntakes)
+      .set({
+        attachments: sql`${claimIntakes.attachments} || ${JSON.stringify([meta])}::jsonb`,
+        updatedAt: new Date(),
+      })
+      .where(and(eq(claimIntakes.id, intakeId), sql`jsonb_array_length(${claimIntakes.attachments}) < 8`))
+      .returning({ id: claimIntakes.id });
+    if (!updated.length) {
+      // No se pudo registrar (tope alcanzado en la carrera): limpiar el objeto.
+      const { deleteObject } = await import('../r2.js');
+      await deleteObject(key).catch(() => {});
+      res.status(409).json({ error: 'Se alcanzó el máximo de adjuntos.' });
+      return;
+    }
+    res.status(201).json({ ok: true });
   }),
 );

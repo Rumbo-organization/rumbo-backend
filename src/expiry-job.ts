@@ -15,13 +15,14 @@
 // (un fallo intermedio reintenta mañana entero). Corre con el cliente owner
 // (batch de sistema): RLS no aplica y el scoping por productor se hace acá.
 
-import { and, eq, gte, inArray, isNull, lte, notExists, sql } from 'drizzle-orm';
+import { and, eq, gte, inArray, isNull, lt, lte, notExists, sql } from 'drizzle-orm';
 
 import { db, schema } from './db/client.js';
 import { sendEmail, type SendEmailInput } from './email.js';
 
 const {
   calendarEvents,
+  claimIntakes,
   communications,
   contacts,
   expiryNotifications,
@@ -122,6 +123,18 @@ interface AgendaItem {
   time: string | null;
   kindLabel: string;
 }
+// Pre-denuncia pendiente de revisión (Slice 5): entra al digest todos los
+// días hasta que el PAS la resuelva — ese es el empujón.
+interface PendingIntake {
+  id: string;
+  orgId: string;
+  producerId: string | null;
+  number: number;
+  tipoLabel: string;
+  ramoLabel: string;
+  nombre: string;
+  daysAgo: number;
+}
 
 function paymentSuffix(pm: string | null): string {
   if (!pm) return '';
@@ -133,9 +146,11 @@ export function composeDigest(
   rows: DuePolicy[],
   appUrl: string,
   agenda: AgendaItem[] = [],
+  intakes: PendingIntake[] = [],
 ): Pick<SendEmailInput, 'subject' | 'text'> {
   const n = rows.length;
   const m = agenda.length;
+  const k = intakes.length;
   const policyLines = rows
     .slice()
     .sort((a, b) => a.endDate.localeCompare(b.endDate))
@@ -148,15 +163,32 @@ export function composeDigest(
     .sort((a, b) => (a.time ?? '99').localeCompare(b.time ?? '99'))
     .map(a => `• ${a.time ? `${a.time.slice(0, 5)} · ` : ''}${a.title} (${a.kindLabel})`);
 
-  const subject =
-    n > 0 && m > 0
-      ? `Vencimientos próximos: ${n} ${n === 1 ? 'póliza' : 'pólizas'} · Hoy: ${m} en agenda`
-      : n > 0
-        ? `Vencimientos próximos: ${n} ${n === 1 ? 'póliza' : 'pólizas'}`
-        : `Tu agenda de hoy: ${m} ${m === 1 ? 'evento' : 'eventos'}`;
+  const intakeLines = intakes
+    .slice()
+    .sort((a, b) => b.daysAgo - a.daysAgo)
+    .map(
+      i =>
+        `• N° ${i.number} · ${i.tipoLabel} (${i.ramoLabel}) · ${i.nombre} · ${i.daysAgo === 0 ? 'hoy' : i.daysAgo === 1 ? 'hace 1 día' : `hace ${i.daysAgo} días`}`,
+    );
+
+  const subjectBits: string[] = [];
+  if (n > 0) subjectBits.push(`Vencimientos próximos: ${n} ${n === 1 ? 'póliza' : 'pólizas'}`);
+  if (k > 0) subjectBits.push(`${k} pre-denuncia${k === 1 ? '' : 's'} sin revisar`);
+  if (m > 0) subjectBits.push(`Hoy: ${m} en agenda`);
+  const subject = subjectBits.join(' · ') || `Tu agenda de hoy: ${m} ${m === 1 ? 'evento' : 'eventos'}`;
 
   const parts: string[] = [];
+  if (k > 0) {
+    parts.push(
+      k === 1 ? 'Tenés 1 pre-denuncia esperando revisión:' : `Tenés ${k} pre-denuncias esperando revisión:`,
+      '',
+      ...intakeLines,
+      '',
+      `Revisarlas en Rumbo: ${appUrl}/?goto=pre-denuncias`,
+    );
+  }
   if (m > 0) {
+    if (parts.length > 0) parts.push('');
     parts.push(
       m === 1 ? 'Tu agenda de hoy (1 evento):' : `Tu agenda de hoy (${m} eventos):`,
       '',
@@ -166,7 +198,7 @@ export function composeDigest(
     );
   }
   if (n > 0) {
-    if (m > 0) parts.push('');
+    if (parts.length > 0) parts.push('');
     parts.push(
       n === 1 ? 'Tenés 1 póliza por vencer en tu cartera:' : `Tenés ${n} pólizas por vencer en tu cartera:`,
       '',
@@ -225,6 +257,12 @@ export async function runExpiryNotifications(
   const today = opts.today ?? todayAr();
   const appUrl = opts.appUrl ?? process.env.APP_PUBLIC_URL ?? process.env.BETTER_AUTH_URL ?? '';
   const contactEmailsEnabled = opts.contactEmailsEnabled ?? process.env.EXPIRY_EMAILS_TO_CONTACTS === 'on';
+
+  // 0. Higiene del Modo B (Slice 5): borradores con el link vencido → vencida.
+  await db
+    .update(claimIntakes)
+    .set({ status: 'vencida', updatedAt: new Date() })
+    .where(and(eq(claimIntakes.status, 'borrador'), lt(claimIntakes.expiresAt, new Date())));
 
   // 1. Candidatas por ventana: vigentes, en ventana (con tolerancia), sin aviso previo.
   const due: DuePolicy[] = [];
@@ -299,12 +337,44 @@ export async function runExpiryNotifications(
     .from(calendarEvents)
     .where(and(eq(calendarEvents.date, today), isNull(calendarEvents.completedAt)));
 
-  if (due.length === 0 && todayEvents.length === 0) {
+  // Pre-denuncias pendientes (Slice 5): entran al digest todos los días hasta
+  // que el PAS las resuelva. Sin dedup propio a propósito.
+  const pendingIntakeRows = await db
+    .select({
+      id: claimIntakes.id,
+      orgId: claimIntakes.orgId,
+      producerId: claimIntakes.producerId,
+      number: claimIntakes.number,
+      incidente: claimIntakes.incidente,
+      aseguradoDeclarado: claimIntakes.aseguradoDeclarado,
+      submittedAt: claimIntakes.submittedAt,
+    })
+    .from(claimIntakes)
+    .where(eq(claimIntakes.status, 'pendiente'));
+  const now = Date.now();
+  const pendingIntakes: PendingIntake[] = pendingIntakeRows.map(r => {
+    const inc = r.incidente as Record<string, unknown>;
+    const ase = r.aseguradoDeclarado as Record<string, unknown>;
+    return {
+      id: r.id,
+      orgId: r.orgId,
+      producerId: r.producerId,
+      number: r.number,
+      tipoLabel: (inc.tipoLabel as string) ?? '—',
+      ramoLabel: (inc.ramoLabel as string) ?? '—',
+      nombre: (ase.nombre as string) ?? '—',
+      daysAgo: Math.max(0, Math.floor((now - r.submittedAt.getTime()) / 86400000)),
+    };
+  });
+
+  if (due.length === 0 && todayEvents.length === 0 && pendingIntakes.length === 0) {
     return { policiesNotified: 0, agendaItemsNotified: 0, digestsSent: 0, contactEmailsSent: 0, sendFailures: [] };
   }
 
   // 2. Destinatarios internos: productores con cuenta + organizador de cada org.
-  const orgIds = [...new Set([...due.map(d => d.orgId), ...todayEvents.map(e => e.orgId)])];
+  const orgIds = [
+    ...new Set([...due.map(d => d.orgId), ...todayEvents.map(e => e.orgId), ...pendingIntakes.map(i => i.orgId)]),
+  ];
   const owners = await db
     .select({ orgId: members.organizationId, email: users.email })
     .from(members)
@@ -353,7 +423,22 @@ export async function runExpiryNotifications(
     pushAgenda(e.producerId ? producerEmailById.get(e.producerId) : null, e);
     pushAgenda(ownerByOrg.get(e.orgId), e);
   }
-  for (const email of agendaByEmail.keys()) {
+
+  // Pre-denuncias pendientes por casilla: mismo scoping (productor lo suyo,
+  // organizador todas las de la org; misma casilla no duplica).
+  const intakesByEmail = new Map<string, PendingIntake[]>();
+  const pushIntake = (email: string | null | undefined, i: PendingIntake) => {
+    if (!email) return;
+    const list = intakesByEmail.get(email) ?? [];
+    if (!list.some(x => x.id === i.id)) list.push(i);
+    intakesByEmail.set(email, list);
+  };
+  for (const i of pendingIntakes) {
+    pushIntake(i.producerId ? producerEmailById.get(i.producerId) : null, i);
+    pushIntake(ownerByOrg.get(i.orgId), i);
+  }
+
+  for (const email of [...agendaByEmail.keys(), ...intakesByEmail.keys()]) {
     if (!digests.has(email)) digests.set(email, []);
   }
 
@@ -362,7 +447,10 @@ export async function runExpiryNotifications(
   let digestsSent = 0;
   for (const [email, rows] of digests) {
     try {
-      await send({ to: email, ...composeDigest(rows, appUrl, agendaByEmail.get(email) ?? []) });
+      await send({
+        to: email,
+        ...composeDigest(rows, appUrl, agendaByEmail.get(email) ?? [], intakesByEmail.get(email) ?? []),
+      });
       digestsSent++;
     } catch (e) {
       sendFailures.push(`digest a ${email}: ${e instanceof Error ? e.message : String(e)}`);

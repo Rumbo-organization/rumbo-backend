@@ -49,6 +49,18 @@ function todayAr(): string {
   return new Date().toLocaleDateString('en-CA', { timeZone: 'America/Argentina/Cordoba' });
 }
 
+// 'HH:MM' de la hora actual en huso AR (para rechazar horas futuras del día de
+// hoy: un siniestro que aún no ocurrió no se puede pre-denunciar). h23 evita el
+// '24:00' de medianoche; ambos zero-padded → la comparación de strings alcanza.
+function nowHmAr(): string {
+  return new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'America/Argentina/Cordoba',
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+  }).format(new Date());
+}
+
 function firstWord(s: string | null | undefined): string {
   return (s ?? '').trim().split(/\s+/)[0] || '';
 }
@@ -221,6 +233,7 @@ function parseSubmit(body: unknown): { data: SubmitInput } | { error: string } {
   if (i.fecha > todayAr()) return { error: 'La fecha del siniestro no puede ser futura.' };
   if (i.fecha < '2000-01-01') return { error: 'La fecha del siniestro no es válida.' };
   if (!isHm(i.hora)) return { error: 'La hora del siniestro no es válida (HH:MM).' };
+  if (i.fecha === todayAr() && i.hora > nowHmAr()) return { error: 'La hora del siniestro no puede ser futura.' };
   const provincia = str(i.provincia, 80);
   const localidad = str(i.localidad, 120);
   if (!provincia || !localidad) return { error: 'Completá provincia y localidad del siniestro.' };

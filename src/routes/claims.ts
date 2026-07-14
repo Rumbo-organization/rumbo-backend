@@ -13,11 +13,15 @@
 
 import { Router, type NextFunction, type Request, type Response } from 'express';
 import { asc, eq } from 'drizzle-orm';
+import { alias } from 'drizzle-orm/pg-core';
 
 import { withAuthedTx, schema, type AuthedTx } from '../db/client.js';
 import { writeAuditLogTx } from '../audit.js';
 
-const { claims, claimEvents, contacts, documents, insurers, policies, users } = schema;
+const { claims, claimEvents, contacts, documents, insurers, members, policies, users } = schema;
+// Alias de `users` para el join del responsable: `users` ya se usa para el autor
+// de los eventos del timeline, así que la ficha necesita una referencia aparte.
+const assignee = alias(users, 'assignee');
 
 // ── Etiquetas (mismo criterio que routes/v1.ts) ──────────────────────────────
 const CLAIM_TYPES = [
@@ -171,12 +175,14 @@ claimsRouter.get('/:id', async (req: Request, res: Response, next: NextFunction)
           ramo: policies.ramo,
           policyNumber: policies.policyNumber,
           insurerName: insurers.name,
+          assigneeName: assignee.name,
           ...contactNameFields,
         })
         .from(claims)
         .innerJoin(policies, eq(policies.id, claims.policyId))
         .innerJoin(contacts, eq(contacts.id, policies.contactId))
         .leftJoin(insurers, eq(insurers.id, policies.insurerId))
+        .leftJoin(assignee, eq(assignee.id, claims.assignedUserId))
         .where(eq(claims.id, id))
         .limit(1);
       if (!row) return null;
@@ -211,6 +217,8 @@ claimsRouter.get('/:id', async (req: Request, res: Response, next: NextFunction)
         policyNumber: row.policyNumber ?? '—',
         opened: c.occurredAt.toISOString().slice(0, 10),
         reportedBy: c.reportedBy,
+        assigneeId: c.assignedUserId,
+        assigneeName: row.assigneeName ?? null,
         location: c.location,
         description: c.description,
         stale: staleDays,
@@ -330,6 +338,69 @@ claimsRouter.patch('/:id/importance', async (req: Request, res: Response, next: 
       id: out.id,
       importance: out.importance ? (CLAIM_IMPORTANCE_LABEL[out.importance] ?? out.importance) : null,
     });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// PATCH /claims/:id/assignee — responsable operativo (miembro del org | null).
+// Como importance, es gestión y no "movimiento" (no bumpea lastActivity). El
+// responsable elegido debe ser miembro de la org; '' o null lo desasigna.
+claimsRouter.patch('/:id/assignee', async (req: Request, res: Response, next: NextFunction) => {
+  const id = req.params.id;
+  if (!isUuid(id)) {
+    res.status(400).json({ error: 'Id inválido.' });
+    return;
+  }
+  const raw = (req.body ?? {}).assignedUserId as unknown;
+  let assignedUserId: string | null;
+  if (raw == null || raw === '') {
+    assignedUserId = null;
+  } else if (isUuid(raw)) {
+    assignedUserId = raw;
+  } else {
+    res.status(400).json({ error: 'Responsable inválido.' });
+    return;
+  }
+  const ctx = req.authCtx!;
+  try {
+    const out = await withAuthedTx(ctx, async tx => {
+      let assigneeName: string | null = null;
+      if (assignedUserId) {
+        const [m] = await tx
+          .select({ name: users.name })
+          .from(members)
+          .innerJoin(users, eq(users.id, members.userId))
+          .where(eq(members.userId, assignedUserId))
+          .limit(1);
+        if (!m) return { badMember: true as const };
+        assigneeName = m.name;
+      }
+      const [row] = await tx
+        .update(claims)
+        .set({ assignedUserId, updatedAt: new Date() })
+        .where(eq(claims.id, id))
+        .returning({ id: claims.id });
+      if (!row) return null;
+      await writeAuditLogTx(tx, {
+        orgId: ctx.orgId,
+        userId: ctx.userId,
+        action: 'update_claim_assignee',
+        entityType: 'claim',
+        entityId: id,
+        payload: { assignedUserId },
+      });
+      return { id: row.id, assigneeName };
+    });
+    if (out && 'badMember' in out) {
+      res.status(400).json({ error: 'Ese usuario no pertenece a tu organización.' });
+      return;
+    }
+    if (!out) {
+      res.status(404).json({ error: 'Siniestro no encontrado.' });
+      return;
+    }
+    res.json({ id: out.id, assigneeId: assignedUserId, assigneeName: out.assigneeName });
   } catch (err) {
     next(err);
   }

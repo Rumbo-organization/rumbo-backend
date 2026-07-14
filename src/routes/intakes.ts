@@ -13,7 +13,8 @@ import { withAuthedTx, schema } from '../db/client.js';
 import { writeAuditLogTx } from '../audit.js';
 import { getObject, isR2Configured } from '../r2.js';
 
-const { claimIntakes, claims, contacts, documents, insurers, policies, producerIntakeLinks, producers } = schema;
+const { claimIntakes, claims, contacts, documents, insurers, members, policies, producerIntakeLinks, producers } =
+  schema;
 
 const INTAKE_STATUS_LABEL: Record<string, string> = {
   pendiente: 'Pendiente',
@@ -405,6 +406,10 @@ intakesRouter.post(
       return;
     }
     const importance = typeof b.importance === 'string' && IMPORTANCES.has(b.importance) ? b.importance : null;
+    // Responsable: quién gestiona el siniestro. Si el front no lo manda (org de
+    // una sola persona → sin selector), o manda uno inválido, el default es quien
+    // convierte (ctx.userId): toma el caso quien lo está dando de alta.
+    const assignedRaw = isUuid(b.assignedUserId) ? b.assignedUserId : null;
 
     const ctx = req.authCtx!;
     const out = await withAuthedTx(ctx, async tx => {
@@ -413,6 +418,18 @@ intakesRouter.post(
       if (intake.status !== 'pendiente') return { error: 409 as const };
       const [policy] = await tx.select({ id: policies.id }).from(policies).where(eq(policies.id, policyId)).limit(1);
       if (!policy) return { error: 400 as const, msg: 'Póliza no encontrada en tu cartera.' };
+
+      // Solo aceptamos el responsable elegido si es miembro de la org (members
+      // está RLS-scopeado); si no, cae al que convierte.
+      let assignedUserId = ctx.userId;
+      if (assignedRaw && assignedRaw !== ctx.userId) {
+        const [m] = await tx
+          .select({ userId: members.userId })
+          .from(members)
+          .where(eq(members.userId, assignedRaw))
+          .limit(1);
+        if (m) assignedUserId = assignedRaw;
+      }
 
       const inc = intake.incidente as Record<string, unknown>;
       const bucket = CLAIM_BUCKETS.has(inc.bucket as string) ? (inc.bucket as 'otros') : 'otros';
@@ -428,6 +445,7 @@ intakesRouter.post(
           tipo: bucket,
           tipoDetalle: (inc.tipoLabel as string) ?? null,
           importance: importance as 'alta' | null,
+          assignedUserId,
           occurredAt,
           reportedBy: reportedByOf(intake),
           location: location || null,
@@ -462,7 +480,7 @@ intakesRouter.post(
         action: 'convert_intake',
         entityType: 'claim_intake',
         entityId: id,
-        payload: { claimId: claim.id, policyId: policy.id },
+        payload: { claimId: claim.id, policyId: policy.id, assignedUserId },
       });
       return { claimId: claim.id };
     });

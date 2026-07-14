@@ -625,6 +625,13 @@ export const claims = pgTable(
     // Priorización del PAS (E4, §2.32). Nullable: los siniestros existentes y los
     // que entran por sync quedan "sin priorizar" hasta que el PAS los clasifique.
     importance: claimImportance('importance'),
+    // Responsable operativo: el miembro del org que gestiona el siniestro ante la
+    // aseguradora (Rocío gestiona los suyos; el organizador ve/reasigna todo).
+    // Ortogonal al scoping por productor (RLS vía póliza): es asignación, no
+    // autorización. Nullable: lo setea la conversión de una pre-denuncia (default
+    // = quien convierte) o la asignación manual. set null si se elimina el
+    // usuario (no se pierde el siniestro). (migración 0008)
+    assignedUserId: uuid('assigned_user_id').references(() => users.id, { onDelete: 'set null' }),
 
     occurredAt: timestamp('occurred_at', { withTimezone: true }).notNull(), // fecha+hora del hecho
     reportedBy: text('reported_by').notNull(), // denunciante
@@ -648,6 +655,7 @@ export const claims = pgTable(
     index('claims_org_idx').on(table.orgId),
     index('claims_org_status_idx').on(table.orgId, table.status),
     index('claims_policy_idx').on(table.policyId),
+    index('claims_assigned_user_idx').on(table.assignedUserId),
     // Idempotencia del import/sync de siniestros: un siniestro externo por
     // (org, ref = nº de siniestro de la aseguradora). El alta manual no setea
     // external_ref → queda fuera del índice (parcial).

@@ -32,8 +32,18 @@ export type ScEnv = keyof typeof BASE_URLS;
 const REQUEST_TIMEOUT_MS = 45_000;
 /** Reintentos ante 5xx/timeout (el 4xx no se reintenta: es contrato, no clima). */
 const MAX_RETRIES = 2;
-/** Presupuesto del token bucket: 2 req/s sostenidos (SC documenta 3/s). */
-const RATE_PER_SEC = 2;
+/**
+ * Presupuesto del token bucket. SC documenta 3/s para el detalle de póliza,
+ * pero eso es el límite por ventana — **no** una autorización a sostenerlo
+ * durante horas. Corriendo el backfill a 2/s sin pausa, SC terminó devolviendo
+ * `403 RBAC: access denied` en TODO el gateway, incluido el `swagger.json`
+ * público (28-jul-2026): es un bloqueo de borde, no de credenciales.
+ *
+ * Por eso el default es conservador y el tope se puede bajar por env. Con la
+ * cola persistida no hace falta ir rápido: lo que no entra en una corrida lo
+ * toma la siguiente.
+ */
+const RATE_PER_SEC = Number(process.env.SC_RATE_PER_SEC ?? 1);
 /** Timeouts consecutivos del MISMO endpoint que abren el breaker. */
 const BREAKER_THRESHOLD = 3;
 /** TTL del token en cache: 110 min, bajo los 120 que dura del lado de SC. */
@@ -71,6 +81,33 @@ export function isWrongRamo(err: unknown): boolean {
 /** El usuario B2B no tiene habilitado el servicio (Comisiones, GetMovements…). */
 export function isNotEnabled(err: unknown): boolean {
   return err instanceof ScError && /no est[aá] habilitad/i.test(err.message);
+}
+
+/**
+ * Bloqueo de borde de SC (`403 RBAC: access denied`). Distinto de "servicio no
+ * habilitado": acá cae TODO, hasta el `swagger.json` público, así que ni
+ * siquiera el login pasa. Si aparece esto **hay que dejar de pegarle a SC** y
+ * hablar con la Mesa de Servicios — insistir solo empeora el bloqueo.
+ */
+export function isBlocked(err: unknown): boolean {
+  return err instanceof ScError && err.status === 403 && /RBAC|access denied/i.test(err.message);
+}
+
+// El gateway de SC devuelve 400 cuando el que se cayó es su propio backend, así
+// que por status no se distingue de un error de contrato. Las tres formas que
+// vimos en UAT: el PolicyCenter caído, un fallo de red del gateway hacia él, y
+// un 500 de IBM_HTTP_Server que vuelve como HTML y rompe el binding SOAP.
+const UPSTREAM_DOWN =
+  /is unavailable|error occurred while sending the request|does not match the content type|Internal Server Error/i;
+
+/**
+ * El problema es de SC, no del dato. Distinguirlo importa: si no, una caída de
+ * su lado agota los reintentos de toda la cola y las pólizas quedan marcadas
+ * como irrecuperables cuando lo único que hacía falta era volver más tarde.
+ */
+export function isTransient(err: unknown): boolean {
+  if (!(err instanceof ScError)) return false;
+  return err.status === null || UPSTREAM_DOWN.test(err.message);
 }
 
 // ── Rate limiting (token bucket global al proceso) ────────────────────────────

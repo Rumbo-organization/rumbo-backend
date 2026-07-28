@@ -39,7 +39,9 @@ import { and, asc, eq, inArray, isNull, notInArray, sql } from 'drizzle-orm';
 
 import { db, schema } from './db/client.js';
 import {
+  isBlocked,
   isNotEnabled,
+  isTransient,
   resetBreaker,
   scClaimDetail,
   scClaimNews,
@@ -806,11 +808,28 @@ async function drainQueue(ctx: Ctx, limit?: number): Promise<void> {
         bump(ctx, 'processed');
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        bump(ctx, 'failed');
+        // Si el que falló fue SC (su backend caído, un timeout), el ítem NO
+        // gasta un intento: no hay nada malo con esta póliza y volver mañana
+        // alcanza. Los intentos se reservan para fallas del dato — sin esta
+        // distinción, una caída de SC marca la cola entera como irrecuperable.
+        // Acotado igual: `triedThisRun` deja como mucho un fallo por corrida.
+        const transient = isTransient(err) || isBlocked(err);
+        bump(ctx, transient ? 'failed_sc' : 'failed');
         await db
           .update(insurerSyncQueue)
-          .set({ attempts: item.attempts + 1, lastError: message.slice(0, 500) })
+          .set({ attempts: transient ? item.attempts : item.attempts + 1, lastError: message.slice(0, 500) })
           .where(eq(insurerSyncQueue.id, item.id));
+
+        // 403 de borde: no es este ítem, es que SC nos cerró la puerta. Seguir
+        // pidiendo solo profundiza el bloqueo → se corta la corrida acá.
+        if (isBlocked(err)) {
+          ctx.notes.push(`SC bloqueó el acceso (403 RBAC). Corrida abortada; avisar a la Mesa de Servicios B2B.`);
+          bump(ctx, 'aborted_blocked');
+          if (done.length > 0) {
+            await db.update(insurerSyncQueue).set({ doneAt: new Date() }).where(inArray(insurerSyncQueue.id, done));
+          }
+          return;
+        }
       }
     }
     if (done.length > 0) {

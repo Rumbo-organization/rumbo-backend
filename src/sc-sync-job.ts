@@ -96,6 +96,19 @@ const MAX_ATTEMPTS = 5;
  * corte de conexión de Neon mató un backfill y dejó la fila en `running`.
  */
 const STALE_RUN_MINUTES = 15;
+/**
+ * Pólizas cuyo detalle se pide en paralelo.
+ *
+ * El cuello de la sync **no es el rate limit, es la latencia**: SC tarda ~30 s
+ * por detalle y permite 3 req/s, así que yendo de a uno se usa el ~1% del caudal
+ * autorizado y un backfill de 125 pólizas se va a más de una hora. Con N en
+ * vuelo el reloj se divide por N y el promedio sigue muy por debajo del límite
+ * (3 × 30 s ⇒ ~0,1 req/s). El token bucket del cliente sigue acotando el pico.
+ *
+ * Default deliberadamente bajo: SC ya nos bloqueó una vez. Subirlo **solo** con
+ * el OK de la Mesa de Servicios sobre cuántas consultas concurrentes aceptan.
+ */
+const CONCURRENCY = Math.max(1, Number(process.env.SC_CONCURRENCY ?? 3));
 
 export type SyncMode = 'backfill' | 'incremental';
 
@@ -292,11 +305,40 @@ function fillIfEmpty<T>(current: T | null | undefined, incoming: T | null): T | 
   return current === null || current === undefined || current === '' ? incoming : current;
 }
 
-async function upsertContact(ctx: Ctx, mapped: MappedContact, producerId: string | null): Promise<string | null> {
+// `contacts` no tiene índice único por documento, así que el "buscá y si no
+// está insertá" es una carrera: con varias pólizas del MISMO titular en vuelo a
+// la vez, las dos no lo encuentran y las dos lo insertan. Se serializa por
+// identidad — solo los del mismo titular esperan, el resto sigue en paralelo.
+const contactLocks = new Map<string, Promise<unknown>>();
+
+function contactKey(orgId: string, mapped: MappedContact): string {
+  const id = mapped.cuit ?? mapped.dni ?? mapped.legalName ?? `${mapped.lastName}|${mapped.firstName}`;
+  return `${orgId}:${(id ?? '').toLowerCase()}`;
+}
+
+async function withContactLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const previous = contactLocks.get(key) ?? Promise.resolve();
+  const current = previous.then(fn, fn);
+  contactLocks.set(
+    key,
+    current.catch(() => {}),
+  );
+  try {
+    return await current;
+  } finally {
+    if (contactLocks.get(key) === current) contactLocks.delete(key);
+  }
+}
+
+function upsertContact(ctx: Ctx, mapped: MappedContact, producerId: string | null): Promise<string | null> {
   if (ctx.dryRun) {
     bump(ctx, 'contacts');
-    return null;
+    return Promise.resolve(null);
   }
+  return withContactLock(contactKey(ctx.orgId, mapped), () => upsertContactLocked(ctx, mapped, producerId));
+}
+
+async function upsertContactLocked(ctx: Ctx, mapped: MappedContact, producerId: string | null): Promise<string | null> {
   const existingId = await findContactId(ctx.orgId, mapped);
 
   if (!existingId) {
@@ -810,48 +852,62 @@ async function drainQueue(ctx: Ctx, limit?: number): Promise<void> {
     if (batch.length === 0) return;
 
     const done: string[] = [];
-    for (const item of batch) {
-      if (outOfTime(ctx)) break;
-      if (limit !== undefined && processed >= limit) break;
-      processed++;
-      triedThisRun.add(item.id);
-      // Latido por ítem, no por tanda: a ~30 s la póliza, una tanda de 20 tarda
-      // más que el margen del reaper y la corrida se declararía muerta sola.
-      await heartbeat(ctx);
-      try {
-        if (item.kind === 'policy') await syncPolicy(ctx, item.externalRef, item.producerCode);
-        else await syncClaim(ctx, item.externalRef);
-        done.push(item.id);
-        bump(ctx, 'processed');
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        // Si el que falló fue SC (su backend caído, un timeout), el ítem NO
-        // gasta un intento: no hay nada malo con esta póliza y volver mañana
-        // alcanza. Los intentos se reservan para fallas del dato — sin esta
-        // distinción, una caída de SC marca la cola entera como irrecuperable.
-        // Acotado igual: `triedThisRun` deja como mucho un fallo por corrida.
-        const transient = isTransient(err) || isBlocked(err);
-        bump(ctx, transient ? 'failed_sc' : 'failed');
-        await db
-          .update(insurerSyncQueue)
-          .set({ attempts: transient ? item.attempts : item.attempts + 1, lastError: message.slice(0, 500) })
-          .where(eq(insurerSyncQueue.id, item.id));
+    let blocked = false;
+    const queue = [...batch];
 
-        // 403 de borde: no es este ítem, es que SC nos cerró la puerta. Seguir
-        // pidiendo solo profundiza el bloqueo → se corta la corrida acá.
-        if (isBlocked(err)) {
-          ctx.notes.push(`SC bloqueó el acceso (403 RBAC). Corrida abortada; avisar a la Mesa de Servicios B2B.`);
-          bump(ctx, 'aborted_blocked');
-          if (done.length > 0) {
-            await db.update(insurerSyncQueue).set({ doneAt: new Date() }).where(inArray(insurerSyncQueue.id, done));
+    // El detalle de SC tarda ~30 s y el límite es de 3 req/s: yendo de a uno se
+    // usa el 1% del caudal permitido y el backfill dura horas. Con N pedidos en
+    // vuelo el reloj se divide por N y el promedio sigue MUY por debajo del
+    // límite (N=3 con 30 s de latencia ≈ 0,1 req/s). El token bucket sigue
+    // acotando el pico, así que la concurrencia no puede desbordarlo.
+    const worker = async (): Promise<void> => {
+      for (;;) {
+        if (blocked || outOfTime(ctx)) return;
+        if (limit !== undefined && processed >= limit) return;
+        const item = queue.shift();
+        if (!item) return;
+        processed++;
+        triedThisRun.add(item.id);
+        // Latido por ítem, no por tanda: a ~30 s la póliza, una tanda de 20
+        // tarda más que el margen del reaper y la corrida se declararía muerta.
+        await heartbeat(ctx);
+        try {
+          if (item.kind === 'policy') await syncPolicy(ctx, item.externalRef, item.producerCode);
+          else await syncClaim(ctx, item.externalRef);
+          done.push(item.id);
+          bump(ctx, 'processed');
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          // Si el que falló fue SC (su backend caído, un timeout), el ítem NO
+          // gasta un intento: no hay nada malo con esta póliza y volver mañana
+          // alcanza. Los intentos se reservan para fallas del dato — sin esta
+          // distinción, una caída de SC marca la cola entera como irrecuperable.
+          // Acotado igual: `triedThisRun` deja como mucho un fallo por corrida.
+          const transient = isTransient(err) || isBlocked(err);
+          bump(ctx, transient ? 'failed_sc' : 'failed');
+          await db
+            .update(insurerSyncQueue)
+            .set({ attempts: transient ? item.attempts : item.attempts + 1, lastError: message.slice(0, 500) })
+            .where(eq(insurerSyncQueue.id, item.id));
+
+          // 403 de borde: no es este ítem, es que SC nos cerró la puerta. Seguir
+          // pidiendo solo profundiza el bloqueo → frena a TODOS los workers.
+          if (isBlocked(err)) {
+            ctx.notes.push('SC bloqueó el acceso (403 RBAC). Corrida abortada; avisar a la Mesa de Servicios B2B.');
+            bump(ctx, 'aborted_blocked');
+            blocked = true;
+            return;
           }
-          return;
         }
       }
-    }
+    };
+
+    await Promise.all(Array.from({ length: Math.min(CONCURRENCY, batch.length) }, worker));
+
     if (done.length > 0) {
       await db.update(insurerSyncQueue).set({ doneAt: new Date() }).where(inArray(insurerSyncQueue.id, done));
     }
+    if (blocked) return;
   }
 }
 
@@ -995,21 +1051,31 @@ export async function replayStoredPolicies(
     runId: null,
   };
 
-  for (const detail of details) {
-    const number = String(detail.PolicyNumber ?? '');
-    const route = knownRoute(number);
-    if (!route) {
-      ctx.notes.push(`Ramo ${ramoCode(number)} sin mapear: ${number}`);
-      bump(ctx, 'skipped');
-      continue;
+  // Mismo pool de workers que el drenado real: así el replay también ejercita
+  // la concurrencia (y el candado por titular que la hace segura), no solo el
+  // mapeo. Sin esto, la ruta concurrente quedaría sin probar mientras SC está
+  // bloqueado, que es justo cuando más falta hace poder verificarla.
+  const pending = [...details];
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      const detail = pending.shift();
+      if (!detail) return;
+      const number = String(detail.PolicyNumber ?? '');
+      const route = knownRoute(number);
+      if (!route) {
+        ctx.notes.push(`Ramo ${ramoCode(number)} sin mapear: ${number}`);
+        bump(ctx, 'skipped');
+        continue;
+      }
+      try {
+        await writePolicy(ctx, detail, route.ramo, null);
+      } catch (err) {
+        ctx.notes.push(`${number}: ${err instanceof Error ? err.message : String(err)}`);
+        bump(ctx, 'failed');
+      }
     }
-    try {
-      await writePolicy(ctx, detail, route.ramo, null);
-    } catch (err) {
-      ctx.notes.push(`${number}: ${err instanceof Error ? err.message : String(err)}`);
-      bump(ctx, 'failed');
-    }
-  }
+  };
+  await Promise.all(Array.from({ length: Math.min(CONCURRENCY, details.length || 1) }, worker));
   return { counters: ctx.counters, notes: ctx.notes };
 }
 

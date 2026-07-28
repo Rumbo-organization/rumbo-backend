@@ -63,7 +63,7 @@ import {
   primaryContact,
   type MappedContact,
 } from './lib/sc/map.js';
-import { fetchDetailByRamo, refineRamo } from './lib/sc/ramos.js';
+import { fetchDetailByRamo, knownRoute, ramoCode, refineRamo, type RumboRamo } from './lib/sc/ramos.js';
 
 const {
   claims,
@@ -360,6 +360,23 @@ async function upsertContact(ctx: Ctx, mapped: MappedContact, producerId: string
  */
 async function syncPolicy(ctx: Ctx, policyNumber: string, producerCodeHint: string | null): Promise<void> {
   const { detail, ramo } = await fetchDetailByRamo(policyNumber);
+  await writePolicy(ctx, detail, ramo, producerCodeHint);
+}
+
+/**
+ * Escribe una póliza y todo lo que cuelga de ella, a partir de un payload de SC
+ * ya traído. Separado del fetch a propósito: así se puede reejecutar la
+ * escritura con los payloads guardados en `policies.external_raw` — que es como
+ * se verifica la idempotencia sin volver a pegarle a SC (ver
+ * `scripts/sc-replay.ts`).
+ */
+async function writePolicy(
+  ctx: Ctx,
+  detail: Record<string, unknown>,
+  ramo: RumboRamo,
+  producerCodeHint: string | null,
+): Promise<void> {
+  const policyNumber = String(detail.PolicyNumber ?? '');
   const policyType =
     (detail.Ext_PolicyType as { Code?: string } | undefined)?.Code ?? (detail.PolicyType as string | undefined);
   const mapped = mapPolicy(detail, refineRamo(ramo, policyType ?? null));
@@ -951,6 +968,49 @@ export async function runScSync(options: SyncOptions): Promise<SyncResult> {
     }
     throw err;
   }
+}
+
+/**
+ * Reejecuta la escritura con payloads de SC ya traídos, sin red de por medio.
+ * Lo usa `scripts/sc-replay.ts` para verificar la idempotencia offline: la
+ * propiedad "correr dos veces no cambia nada" no debería depender de que SC
+ * esté disponible para poder probarse.
+ *
+ * No abre corrida ni toca la cola: solo el camino de escritura.
+ */
+export async function replayStoredPolicies(
+  orgId: string,
+  details: Array<Record<string, unknown>>,
+): Promise<{ counters: Record<string, number>; notes: string[] }> {
+  const insurerId = await resolveInsurerId(orgId);
+  const ctx: Ctx = {
+    orgId,
+    insurerId,
+    deadline: Number.MAX_SAFE_INTEGER,
+    dryRun: false,
+    counters: {},
+    notes: [],
+    producerByCode: await loadProducerByCode(orgId, insurerId),
+    dryQueue: [],
+    runId: null,
+  };
+
+  for (const detail of details) {
+    const number = String(detail.PolicyNumber ?? '');
+    const route = knownRoute(number);
+    if (!route) {
+      ctx.notes.push(`Ramo ${ramoCode(number)} sin mapear: ${number}`);
+      bump(ctx, 'skipped');
+      continue;
+    }
+    try {
+      await writePolicy(ctx, detail, route.ramo, null);
+    } catch (err) {
+      ctx.notes.push(`${number}: ${err instanceof Error ? err.message : String(err)}`);
+      bump(ctx, 'failed');
+    }
+  }
+  return { counters: ctx.counters, notes: ctx.notes };
 }
 
 function summarize(notes: string[], tripped: string[]): string | null {

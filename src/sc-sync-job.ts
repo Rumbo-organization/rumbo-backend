@@ -35,7 +35,7 @@
 // movimientos. El histórico completo sigue viniendo del export XLSX
 // (docs/rumbo/15-import-cartera.md) — los dos caminos son complementarios.
 
-import { and, asc, eq, inArray, isNull, sql } from 'drizzle-orm';
+import { and, asc, eq, inArray, isNull, notInArray, sql } from 'drizzle-orm';
 
 import { db, schema } from './db/client.js';
 import {
@@ -763,6 +763,13 @@ async function drainQueue(ctx: Ctx, limit?: number): Promise<void> {
     return;
   }
 
+  // Un ítem que falló NO se vuelve a intentar en esta misma corrida. Sin esto,
+  // el select lo reelige enseguida (ordena por `attempts` ascendente) y le quema
+  // los 5 intentos de un saque: si la causa es sistémica —un token vencido, SC
+  // caído— la corrida entera se va en reintentos inútiles y la cola queda
+  // agotada. El reintento de verdad es la próxima corrida.
+  const triedThisRun = new Set<string>();
+
   for (;;) {
     if (outOfTime(ctx)) return;
     if (limit !== undefined && processed >= limit) return;
@@ -776,6 +783,7 @@ async function drainQueue(ctx: Ctx, limit?: number): Promise<void> {
           eq(insurerSyncQueue.insurerId, ctx.insurerId),
           isNull(insurerSyncQueue.doneAt),
           sql`${insurerSyncQueue.attempts} < ${MAX_ATTEMPTS}`,
+          triedThisRun.size > 0 ? notInArray(insurerSyncQueue.id, [...triedThisRun]) : undefined,
         ),
       )
       .orderBy(asc(insurerSyncQueue.attempts), asc(insurerSyncQueue.enqueuedAt))
@@ -787,6 +795,7 @@ async function drainQueue(ctx: Ctx, limit?: number): Promise<void> {
       if (outOfTime(ctx)) break;
       if (limit !== undefined && processed >= limit) break;
       processed++;
+      triedThisRun.add(item.id);
       // Latido por ítem, no por tanda: a ~30 s la póliza, una tanda de 20 tarda
       // más que el margen del reaper y la corrida se declararía muerta sola.
       await heartbeat(ctx);

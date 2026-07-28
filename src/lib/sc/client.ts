@@ -149,15 +149,21 @@ async function login(): Promise<string> {
  * Token vigente, de cache si lo hay. Redis lo comparte entre invocaciones
  * serverless (cada cold start arranca con la memoria vacía); sin Redis cae a
  * memoria de módulo, que alcanza para el CLI y para Docker.
+ *
+ * `force` descarta lo cacheado y vuelve a loguear — lo usa el 401 de `scGet`.
  */
-export async function getToken(): Promise<string> {
-  if (memoToken && memoToken.expiresAt > Date.now()) return memoToken.value;
-
-  if (isRedisConfigured()) {
-    const cached = await redisGet(tokenCacheKey()).catch(() => null);
-    if (cached) {
-      memoToken = { value: cached, expiresAt: Date.now() + 60_000 };
-      return cached;
+export async function getToken(force = false): Promise<string> {
+  if (!force) {
+    if (memoToken && memoToken.expiresAt > Date.now()) return memoToken.value;
+    if (isRedisConfigured()) {
+      const cached = await redisGet(tokenCacheKey()).catch(() => null);
+      if (cached) {
+        // Ojo: el TTL de Redis dice cuánto le queda a la CLAVE, no al token, y
+        // este proceso no sabe cuándo se emitió. Se confía por poco tiempo; si
+        // ya venció, el 401 de `scGet` lo descarta y vuelve a loguear.
+        memoToken = { value: cached, expiresAt: Date.now() + 60_000 };
+        return cached;
+      }
     }
   }
 
@@ -203,9 +209,10 @@ export async function scGet<T>(path: string): Promise<T> {
   }
 
   let lastErr: ScError | null = null;
+  let reauthed = false;
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     await takeToken();
-    const token = await getToken();
+    const token = await getToken(reauthed);
     let r: Response;
     try {
       r = await fetch(`${BASE_URLS[scEnv()]}${path}`, {
@@ -234,6 +241,18 @@ export async function scGet<T>(path: string): Promise<T> {
     if (!r.ok) {
       const reason = failureReason(body) ?? raw.slice(0, 200);
       lastErr = new ScError(`SC ${r.status}: ${reason}`, path, r.status);
+
+      // 401 = el token venció. Pasa de verdad: un backfill largo cruza los 120
+      // min de vida del token, y el que sale de Redis puede venir ya usado por
+      // otro proceso (el TTL de la clave no dice cuándo se emitió). Se descarta
+      // lo cacheado, se vuelve a loguear y se reintenta UNA vez. Sin esto, un
+      // token vencido convierte el resto de la corrida en 401 en cadena — nos
+      // costó 103 pólizas en un backfill.
+      if (r.status === 401 && !reauthed) {
+        reauthed = true;
+        continue;
+      }
+
       // 4xx = contrato (ramo equivocado, servicio no habilitado): no se reintenta.
       // El 429 es la excepción: SC tiene cuotas por ventana (3/s en el detalle,
       // 1 cada 5 s en comisiones) y esperar alcanza. `Retry-After` si viene.

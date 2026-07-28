@@ -127,8 +127,14 @@ CREATE TABLE IF NOT EXISTS "insurer_sync_runs" (
   "counters" jsonb DEFAULT '{}'::jsonb NOT NULL,
   "notes" text,
   "started_at" timestamp with time zone DEFAULT now() NOT NULL,
+  -- Latido de la corrida: lo bumpea el job cada tanda de trabajo. El reaper mira
+  -- ESTO y no `started_at`, porque un backfill legítimo puede durar más de una
+  -- hora y no debe darse por abandonado mientras avanza.
+  "heartbeat_at" timestamp with time zone DEFAULT now() NOT NULL,
   "finished_at" timestamp with time zone
 );
+
+ALTER TABLE "insurer_sync_runs" ADD COLUMN IF NOT EXISTS "heartbeat_at" timestamp with time zone DEFAULT now() NOT NULL;
 
 DO $$ BEGIN
   ALTER TABLE "insurer_sync_runs" ADD CONSTRAINT "insurer_sync_runs_org_id_organizations_id_fk" FOREIGN KEY ("org_id") REFERENCES "public"."organizations"("id") ON DELETE cascade ON UPDATE no action;

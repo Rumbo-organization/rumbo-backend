@@ -87,8 +87,13 @@ const FEED_WINDOW_DAYS = 30;
 const MAX_FEED_DAYS_PER_RUN = 30;
 /** Un ítem que falló tantas veces deja de reintentarse (queda con last_error). */
 const MAX_ATTEMPTS = 5;
-/** Una corrida sin cerrar más vieja que esto se da por abandonada (proceso muerto). */
-const STALE_RUN_MINUTES = 60;
+/**
+ * Sin latido por este tiempo, la corrida se da por abandonada (proceso muerto).
+ * Se mide contra `heartbeat_at`, no contra `started_at`: un backfill legítimo
+ * puede durar horas y no debe reaparse mientras avanza. Pasó de verdad — un
+ * corte de conexión de Neon mató un backfill y dejó la fila en `running`.
+ */
+const STALE_RUN_MINUTES = 15;
 
 export type SyncMode = 'backfill' | 'incremental';
 
@@ -157,6 +162,14 @@ interface Ctx {
   producerByCode: Map<string, string>;
   /** Cola en memoria del dry-run (no se toca la tabla, pero se drena igual). */
   dryQueue: EnqueueItem[];
+  /** Fila de `insurer_sync_runs` de esta corrida (null en dry-run). */
+  runId: string | null;
+}
+
+/** Marca que la corrida sigue viva, para que el reaper no la dé por colgada. */
+async function heartbeat(ctx: Ctx): Promise<void> {
+  if (!ctx.runId) return;
+  await db.update(insurerSyncRuns).set({ heartbeatAt: new Date() }).where(eq(insurerSyncRuns.id, ctx.runId));
 }
 
 function bump(ctx: Ctx, key: string, n = 1): void {
@@ -596,6 +609,7 @@ async function syncClaim(ctx: Ctx, claimNumber: string): Promise<void> {
 async function feedPortfolio(ctx: Ctx, refs: ScProducerRef[]): Promise<void> {
   for (const ref of refs) {
     if (outOfTime(ctx)) return;
+    await heartbeat(ctx);
     const rows = await scPortfolio(ref.Code);
     bump(ctx, 'portfolio_rows', rows.length);
 
@@ -661,6 +675,7 @@ async function feedIncremental(ctx: Ctx, refs: ScProducerRef[]): Promise<void> {
     ] as Array<[CursorField, string]>) {
       for (const day of pendingFeedDays(state[field])) {
         if (outOfTime(ctx)) return;
+        await heartbeat(ctx);
         try {
           await runFeedDay(ctx, ref, feed, day);
         } catch (err) {
@@ -772,6 +787,9 @@ async function drainQueue(ctx: Ctx, limit?: number): Promise<void> {
       if (outOfTime(ctx)) break;
       if (limit !== undefined && processed >= limit) break;
       processed++;
+      // Latido por ítem, no por tanda: a ~30 s la póliza, una tanda de 20 tarda
+      // más que el margen del reaper y la corrida se declararía muerta sola.
+      await heartbeat(ctx);
       try {
         if (item.kind === 'policy') await syncPolicy(ctx, item.externalRef, item.producerCode);
         else await syncClaim(ctx, item.externalRef);
@@ -843,6 +861,7 @@ export async function runScSync(options: SyncOptions): Promise<SyncResult> {
     notes: [],
     producerByCode: await loadProducerByCode(orgId, insurerId),
     dryQueue: [],
+    runId: null,
   };
 
   resetBreaker();
@@ -854,9 +873,9 @@ export async function runScSync(options: SyncOptions): Promise<SyncResult> {
     await db.execute(sql`
       UPDATE insurer_sync_runs
          SET status = 'error', finished_at = now(),
-             notes = coalesce(notes || E'\n', '') || 'Corrida abandonada (sin cierre en ' || ${STALE_RUN_MINUTES} || ' min).'
+             notes = coalesce(notes || E'\n', '') || 'Corrida abandonada (sin latido en ' || ${STALE_RUN_MINUTES} || ' min).'
        WHERE org_id = ${orgId} AND status = 'running'
-         AND started_at < now() - (${STALE_RUN_MINUTES} || ' minutes')::interval`);
+         AND heartbeat_at < now() - (${STALE_RUN_MINUTES} || ' minutes')::interval`);
 
     const claimed = await db.execute<{ id: string }>(sql`
       INSERT INTO insurer_sync_runs (org_id, insurer_id, mode)
@@ -867,6 +886,7 @@ export async function runScSync(options: SyncOptions): Promise<SyncResult> {
     if (!runId) {
       return { runId: null, mode: options.mode, orgId, counters: { skipped_locked: 1 }, tripped: [], notes: [] };
     }
+    ctx.runId = runId;
   }
 
   try {

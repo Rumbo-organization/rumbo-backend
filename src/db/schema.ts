@@ -1505,6 +1505,9 @@ export const insurerSyncRuns = pgTable(
     notes: text('notes'),
 
     startedAt: timestamp('started_at', { withTimezone: true }).notNull().defaultNow(),
+    /** Latido: lo bumpea el job mientras avanza. El reaper de corridas colgadas
+     *  mira esto y no `started_at` — un backfill legítimo puede durar horas. */
+    heartbeatAt: timestamp('heartbeat_at', { withTimezone: true }).notNull().defaultNow(),
     finishedAt: timestamp('finished_at', { withTimezone: true }),
   },
   table => [

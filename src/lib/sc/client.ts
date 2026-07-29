@@ -194,6 +194,19 @@ export function resetBreaker(): void {
   consecutiveTimeouts.clear();
 }
 
+const BREAKER_MSG = 'Breaker abierto para';
+
+/**
+ * El fallo fue el corte local, no un intento real contra SC. A diferencia de un
+ * timeout suelto, esto significa que el endpoint ya falló varias veces seguidas
+ * — evidencia de algo persistente, no de un mal momento. Por eso **sí** gasta
+ * intentos: si no, una póliza de un endpoint roto (`combined`) queda pendiente
+ * para siempre y la cola nunca llega a cero.
+ */
+export function isBreakerOpen(err: unknown): boolean {
+  return err instanceof ScError && err.message.startsWith(BREAKER_MSG);
+}
+
 function breakerKey(path: string): string {
   return path.split('?')[0] ?? path;
 }
@@ -287,7 +300,7 @@ function failureReason(body: unknown): string | null {
 export async function scGet<T>(path: string): Promise<T> {
   const key = breakerKey(path);
   if ((consecutiveTimeouts.get(key) ?? 0) >= BREAKER_THRESHOLD) {
-    throw new ScError(`Breaker abierto para ${key} (${BREAKER_THRESHOLD} timeouts seguidos).`, path, null);
+    throw new ScError(`${BREAKER_MSG} ${key} (${BREAKER_THRESHOLD} timeouts seguidos).`, path, null);
   }
 
   let lastErr: ScError | null = null;

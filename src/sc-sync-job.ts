@@ -40,6 +40,7 @@ import { and, asc, eq, inArray, isNull, notInArray, sql } from 'drizzle-orm';
 import { db, schema } from './db/client.js';
 import {
   isBlocked,
+  isBreakerOpen,
   isNotEnabled,
   isTransient,
   resetBreaker,
@@ -890,7 +891,12 @@ async function drainQueue(ctx: Ctx, limit?: number): Promise<void> {
           // alcanza. Los intentos se reservan para fallas del dato — sin esta
           // distinción, una caída de SC marca la cola entera como irrecuperable.
           // Acotado igual: `triedThisRun` deja como mucho un fallo por corrida.
-          const transient = isTransient(err) || isBlocked(err);
+          // El breaker abierto es la excepción a "los fallos de SC no gastan
+          // intentos": significa que el endpoint viene fallando en serie, no que
+          // tuvo un mal momento. Si no gastara intentos, las pólizas de un
+          // endpoint roto (`combined`) quedarían pendientes para siempre y la
+          // cola nunca llegaría a cero.
+          const transient = (isTransient(err) || isBlocked(err)) && !isBreakerOpen(err);
           bump(ctx, transient ? 'failed_sc' : 'failed');
           await db
             .update(insurerSyncQueue)

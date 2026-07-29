@@ -75,6 +75,42 @@ app.get('/api/cron/expiry-notifications', async (req, res) => {
   }
 });
 
+// Cron diario de la sync con San Cristóbal (doc 18). Mismo contrato que el de
+// vencimientos: job de SISTEMA, sin sesión, protegido por CRON_SECRET.
+//
+// Corre en modo incremental (los 3 feeds diarios + drenado de la cola) con un
+// presupuesto de 50 s: lo que no llega a procesarse queda pendiente en
+// `insurer_sync_queue` y lo toma la corrida siguiente. El backfill inicial NO
+// va por acá — no entra en el tiempo de una función; se hace con
+// scripts/sc-sync.ts.
+//
+// SC_SYNC_ENABLED actúa de interruptor: sin él en `on` la ruta responde 200 sin
+// tocar nada, así el deploy productivo queda inerte hasta tener credenciales de
+// PROD (hoy solo tenemos UAT, cuya data es un sandbox que no va a prod).
+app.get('/api/cron/sc-sync', async (req, res) => {
+  const secret = process.env.CRON_SECRET;
+  if (!secret) {
+    res.status(503).json({ error: 'CRON_SECRET sin configurar.' });
+    return;
+  }
+  if (req.headers.authorization !== `Bearer ${secret}`) {
+    res.status(401).json({ error: 'No autorizado.' });
+    return;
+  }
+  if (process.env.SC_SYNC_ENABLED !== 'on') {
+    res.json({ skipped: 'SC_SYNC_ENABLED no está en "on".' });
+    return;
+  }
+  try {
+    const { runScSync } = await import('./sc-sync-job.js');
+    const result = await runScSync({ mode: 'incremental', budgetMs: 50_000 });
+    res.json(result);
+  } catch (err) {
+    console.error('[cron:sc-sync]', err);
+    res.status(500).json({ error: 'La corrida falló; se reintenta mañana.' });
+  }
+});
+
 // Pre-denuncias públicas (Slice 1): el formulario del asegurado, SIN sesión.
 // Rate limit propio y más estricto que v1 (20 POST/min por IP, presupuesto
 // separado por el prefijo); adentro, cliente owner scopeado por slug.

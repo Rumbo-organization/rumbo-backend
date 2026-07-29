@@ -1,0 +1,472 @@
+// Cliente HTTP del gateway B2B de San Cristóbal (docs/rumbo/18-api-b2b-sancristobal.md).
+//
+// SOLO LECTURA: acá no hay un solo endpoint de escritura. El acuerdo con SC nos
+// habilita a leer la cartera de los códigos de productor asociados al usuario
+// B2B; cualquier POST que no sea el login es un bug.
+//
+// Sin SDK (mismo criterio que email.ts/redis.ts): fetch directo. Tres cosas que
+// este cliente resuelve y que NO son opcionales:
+//
+//  1. **Token cacheado.** `Expires_In` viene en MINUTOS (no segundos) y SC no
+//     emite un token nuevo hasta que pasan los 120 min: re-loguear devuelve el
+//     mismo. Si no se cachea, cada corrida quema una llamada al login para nada.
+//  2. **Doble validación de error.** Un 200 puede ser un error de negocio: hay
+//     que mirar `HasError` dentro del body. Nunca asumir éxito por el status.
+//  3. **Rate limits.** SC documenta 3/s para el detalle de póliza; acá se va a
+//     2/s (margen) con un token bucket global al proceso.
+//
+// Verificado contra UAT el 28-jul-2026. Endpoints confirmados deshabilitados
+// para el usuario `B2B_Rumbo`: `Job/GetMovements`, `Producer/producer-promises`,
+// `Producer/earned-commissions-paginated` (ver §9 del doc).
+
+import { isRedisConfigured, redisGet, redisSet } from '../../redis.js';
+
+const BASE_URLS = {
+  uat: 'https://api-uat.sancristobalonline.com.ar/b2b-gateway',
+  prod: 'https://api.sancristobal.com.ar/b2b-gateway',
+} as const;
+
+export type ScEnv = keyof typeof BASE_URLS;
+
+/**
+ * Timeout por request.
+ *
+ * Estaba en 45 s y **era demasiado justo**: hay pólizas que SC responde bien
+ * pero en ~43 s (medido: 42,8 s y 41,5 s en dos que venían fallando corrida
+ * tras corrida). Pasaban raspando y cualquier variación las tiraba, así que
+ * parecían "SC inestable" cuando en realidad las estábamos cortando nosotros.
+ *
+ * A 90 s entran con margen. Lo que encarece es el endpoint que cuelga de verdad
+ * (`combined`): 3 intentos × 90 s antes de que abra el breaker. Son ~4 min de
+ * una corrida de 32, y solo la primera vez.
+ */
+const REQUEST_TIMEOUT_MS = Number(process.env.SC_TIMEOUT_MS ?? 90_000);
+/** Reintentos ante 5xx/timeout (el 4xx no se reintenta: es contrato, no clima). */
+const MAX_RETRIES = 2;
+/**
+ * Presupuesto del token bucket. SC documenta 3/s para el detalle de póliza,
+ * pero eso es el límite por ventana — **no** una autorización a sostenerlo
+ * durante horas. Corriendo el backfill a 2/s sin pausa, SC terminó devolviendo
+ * `403 RBAC: access denied` en TODO el gateway, incluido el `swagger.json`
+ * público (28-jul-2026): es un bloqueo de borde, no de credenciales.
+ *
+ * Por eso el default es conservador y el tope se puede bajar por env. Con la
+ * cola persistida no hace falta ir rápido: lo que no entra en una corrida lo
+ * toma la siguiente.
+ */
+const RATE_PER_SEC = Number(process.env.SC_RATE_PER_SEC ?? 1);
+/** Timeouts consecutivos del MISMO endpoint que abren el breaker. */
+const BREAKER_THRESHOLD = 3;
+/** TTL del token en cache: 110 min, bajo los 120 que dura del lado de SC. */
+const TOKEN_TTL_SEC = 110 * 60;
+
+export function scEnv(): ScEnv {
+  return process.env.SC_B2B_ENV === 'prod' ? 'prod' : 'uat';
+}
+
+export function isScConfigured(): boolean {
+  return Boolean(process.env.SC_B2B_USER && process.env.SC_B2B_PASSWORD);
+}
+
+// ── Errores ──────────────────────────────────────────────────────────────────
+
+export class ScError extends Error {
+  constructor(
+    message: string,
+    readonly path: string,
+    /** `null` cuando el fallo fue de red/timeout (no hubo respuesta). */
+    readonly status: number | null,
+    /** `true` cuando el 200 traía `HasError` (error de negocio, no de transporte). */
+    readonly business = false,
+  ) {
+    super(message);
+    this.name = 'ScError';
+  }
+}
+
+/** Ramo equivocado para ese endpoint de detalle: SC responde 422 y es barato. */
+export function isWrongRamo(err: unknown): boolean {
+  return err instanceof ScError && err.status === 422;
+}
+
+/** El usuario B2B no tiene habilitado el servicio (Comisiones, GetMovements…). */
+export function isNotEnabled(err: unknown): boolean {
+  return err instanceof ScError && /no est[aá] habilitad/i.test(err.message);
+}
+
+/**
+ * Bloqueo de borde de SC (`403 RBAC: access denied`). Distinto de "servicio no
+ * habilitado": acá cae TODO, hasta el `swagger.json` público, así que ni
+ * siquiera el login pasa. Si aparece esto **hay que dejar de pegarle a SC** y
+ * hablar con la Mesa de Servicios — insistir solo empeora el bloqueo.
+ */
+export function isBlocked(err: unknown): boolean {
+  return err instanceof ScError && err.status === 403 && /RBAC|access denied/i.test(err.message);
+}
+
+// El gateway de SC devuelve 400 cuando el que se cayó es su propio backend, así
+// que por status no se distingue de un error de contrato. Las tres formas que
+// vimos en UAT: el PolicyCenter caído, un fallo de red del gateway hacia él, y
+// un 500 de IBM_HTTP_Server que vuelve como HTML y rompe el binding SOAP.
+const UPSTREAM_DOWN =
+  /is unavailable|error occurred while sending the request|does not match the content type|Internal Server Error/i;
+
+/**
+ * El problema es de SC, no del dato. Distinguirlo importa: si no, una caída de
+ * su lado agota los reintentos de toda la cola y las pólizas quedan marcadas
+ * como irrecuperables cuando lo único que hacía falta era volver más tarde.
+ */
+export function isTransient(err: unknown): boolean {
+  if (!(err instanceof ScError)) return false;
+  return err.status === null || UPSTREAM_DOWN.test(err.message);
+}
+
+// ── Rate limiting ─────────────────────────────────────────────────────────────
+//
+// ⚠️ Lo que SC documenta y lo que SC aplica NO coinciden. La WIKI dice 3 req/s
+// para el detalle de póliza; lo que devuelve el gateway cuando te pasás es:
+//
+//   429 — "Cuota excedida. Máximo permitido: 1 por 30s."
+//
+// Noventa veces más estricto. De ahí salía el "~32 s por póliza" que medimos y
+// leímos como latencia del backend: no era latencia, era la cuota. Por eso el
+// backfill secuencial funcionaba (1 cada ~32 s, apenas por debajo) y por eso
+// pedir de a 3 en paralelo produce 429 en dos de cada tres.
+//
+// Consecuencia dura: **el detalle no se puede acelerar**. 125 pólizas ≈ 1 h,
+// 990 (la cartera real de Pablo) ≈ 8 h. Solo lo cambia que SC suba la cuota.
+
+/** Intervalo mínimo entre llamadas al MISMO endpoint, en ms. */
+const MIN_INTERVAL_MS: Array<[RegExp, number]> = [
+  // Cuota real observada en UAT (29-jul-2026). +2 s de margen: el 429 dice
+  // "inténtalo de nuevo en 29 segundo(s)" y no queremos rozar el borde.
+  [/^\/api\/PolicyDetail\//, 32_000],
+  // §13 del doc, y el 429 lo confirma con el mismo formato de mensaje.
+  [/^\/api\/Producer\/earned-commissions-paginated/, 5_000],
+  [/^\/api\/Report/, 10_000],
+];
+
+const lastCallAt = new Map<string, number>();
+
+function minInterval(path: string): number {
+  return MIN_INTERVAL_MS.find(([re]) => re.test(path))?.[1] ?? 0;
+}
+
+/** Espera lo que falte para respetar la cuota por endpoint. */
+async function waitForEndpoint(path: string): Promise<void> {
+  const interval = minInterval(path);
+  if (interval === 0) return;
+  const key = breakerKey(path);
+  for (;;) {
+    const last = lastCallAt.get(key) ?? 0;
+    const wait = last + interval - Date.now();
+    if (wait <= 0) break;
+    await sleep(wait);
+  }
+  lastCallAt.set(key, Date.now());
+}
+
+// ── Token bucket global al proceso (tope de pico, además de lo de arriba) ─────
+
+let tokens = RATE_PER_SEC;
+let lastRefill = Date.now();
+
+async function takeToken(): Promise<void> {
+  for (;;) {
+    const now = Date.now();
+    tokens = Math.min(RATE_PER_SEC, tokens + ((now - lastRefill) / 1000) * RATE_PER_SEC);
+    lastRefill = now;
+    if (tokens >= 1) {
+      tokens -= 1;
+      return;
+    }
+    await sleep(Math.ceil(((1 - tokens) / RATE_PER_SEC) * 1000));
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// ── Circuit breaker por endpoint ─────────────────────────────────────────────
+//
+// UAT tiene endpoints que cuelgan indefinidamente (`PolicyDetail/combined` no
+// respondió en 90 s, tres veces). Sin breaker, una corrida con presupuesto de
+// 50 s se consume entera en un solo request muerto y la cola nunca avanza.
+
+const consecutiveTimeouts = new Map<string, number>();
+
+/** Endpoints que agotaron el umbral en esta corrida (para reportar en la bitácora). */
+export function trippedEndpoints(): string[] {
+  return [...consecutiveTimeouts].filter(([, n]) => n >= BREAKER_THRESHOLD).map(([k]) => k);
+}
+
+export function resetBreaker(): void {
+  consecutiveTimeouts.clear();
+}
+
+const BREAKER_MSG = 'Breaker abierto para';
+
+/** ¿Este endpoint ya está cortado en esta corrida? Lo consulta la sonda de ramo. */
+export function isTripped(path: string): boolean {
+  return (consecutiveTimeouts.get(breakerKey(path)) ?? 0) >= BREAKER_THRESHOLD;
+}
+
+/**
+ * El fallo fue el corte local, no un intento real contra SC. A diferencia de un
+ * timeout suelto, esto significa que el endpoint ya falló varias veces seguidas
+ * — evidencia de algo persistente, no de un mal momento. Por eso **sí** gasta
+ * intentos: si no, una póliza de un endpoint roto (`combined`) queda pendiente
+ * para siempre y la cola nunca llega a cero.
+ */
+export function isBreakerOpen(err: unknown): boolean {
+  return err instanceof ScError && err.message.startsWith(BREAKER_MSG);
+}
+
+function breakerKey(path: string): string {
+  return path.split('?')[0] ?? path;
+}
+
+// ── Token ────────────────────────────────────────────────────────────────────
+
+let memoToken: { value: string; expiresAt: number } | null = null;
+
+function tokenCacheKey(): string {
+  return `sc:token:${scEnv()}:${process.env.SC_B2B_USER}`;
+}
+
+async function login(): Promise<string> {
+  const userName = process.env.SC_B2B_USER;
+  const password = process.env.SC_B2B_PASSWORD;
+  if (!userName || !password)
+    throw new ScError('SC_B2B_USER/SC_B2B_PASSWORD sin configurar.', '/api/Auth/LoginAsync', null);
+
+  const r = await fetch(`${BASE_URLS[scEnv()]}/api/Auth/LoginAsync`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ userName, password }),
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+  });
+  if (!r.ok) {
+    const body = await r.text().catch(() => '');
+    throw new ScError(`Login SC ${r.status}: ${body.slice(0, 200)}`, '/api/Auth/LoginAsync', r.status);
+  }
+  const body = (await r.json()) as { Auth_Token?: string; Expires_In?: number };
+  if (!body.Auth_Token) throw new ScError('Login SC sin Auth_Token.', '/api/Auth/LoginAsync', r.status);
+  return body.Auth_Token;
+}
+
+/**
+ * Token vigente, de cache si lo hay. Redis lo comparte entre invocaciones
+ * serverless (cada cold start arranca con la memoria vacía); sin Redis cae a
+ * memoria de módulo, que alcanza para el CLI y para Docker.
+ *
+ * `force` descarta lo cacheado y vuelve a loguear — lo usa el 401 de `scGet`.
+ */
+export async function getToken(force = false): Promise<string> {
+  if (!force) {
+    if (memoToken && memoToken.expiresAt > Date.now()) return memoToken.value;
+    if (isRedisConfigured()) {
+      const cached = await redisGet(tokenCacheKey()).catch(() => null);
+      if (cached) {
+        // Ojo: el TTL de Redis dice cuánto le queda a la CLAVE, no al token, y
+        // este proceso no sabe cuándo se emitió. Se confía por poco tiempo; si
+        // ya venció, el 401 de `scGet` lo descarta y vuelve a loguear.
+        memoToken = { value: cached, expiresAt: Date.now() + 60_000 };
+        return cached;
+      }
+    }
+  }
+
+  const token = await login();
+  memoToken = { value: token, expiresAt: Date.now() + TOKEN_TTL_SEC * 1000 };
+  if (isRedisConfigured()) await redisSet(tokenCacheKey(), token, TOKEN_TTL_SEC).catch(() => {});
+  return token;
+}
+
+// ── Request ──────────────────────────────────────────────────────────────────
+
+interface ScEnvelope {
+  HasError?: boolean;
+  Messages?: Array<{ Description?: string; MessageBeautiful?: string; Code?: string }>;
+}
+
+function envelopeError(body: unknown): string | null {
+  if (!body || typeof body !== 'object') return null;
+  const env = body as ScEnvelope;
+  if (env.HasError !== true) return null;
+  const msg = (env.Messages ?? [])
+    .map(m => m.MessageBeautiful ?? m.Description ?? m.Code)
+    .filter(Boolean)
+    .join('; ');
+  return msg || 'HasError sin Messages';
+}
+
+/** `failureReason` es la forma que usa el gateway para los errores de gateway. */
+function failureReason(body: unknown): string | null {
+  if (!body || typeof body !== 'object') return null;
+  const reason = (body as { failureReason?: unknown }).failureReason;
+  return typeof reason === 'string' ? reason : null;
+}
+
+/**
+ * GET autenticado contra el gateway. Aplica rate limit, timeout, reintentos y
+ * las DOS validaciones de error (status + `HasError`).
+ */
+export async function scGet<T>(path: string): Promise<T> {
+  const key = breakerKey(path);
+  if ((consecutiveTimeouts.get(key) ?? 0) >= BREAKER_THRESHOLD) {
+    throw new ScError(`${BREAKER_MSG} ${key} (${BREAKER_THRESHOLD} timeouts seguidos).`, path, null);
+  }
+
+  let lastErr: ScError | null = null;
+  let reauthed = false;
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    await waitForEndpoint(path);
+    await takeToken();
+    const token = await getToken(reauthed);
+    let r: Response;
+    try {
+      r = await fetch(`${BASE_URLS[scEnv()]}${path}`, {
+        headers: { Authorization: `Bearer ${token}` },
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
+    } catch (err) {
+      // Timeout / red caída: NO se reintenta acá. Un reintento cuesta otros 45 s
+      // y el cron tiene un presupuesto de decenas de segundos — tres intentos
+      // seguidos se comen la corrida entera sin drenar nada. El reintento real
+      // es la cola persistida: el ítem queda pendiente y lo toma la próxima
+      // corrida. A los BREAKER_THRESHOLD fallos el endpoint queda cortado.
+      consecutiveTimeouts.set(key, (consecutiveTimeouts.get(key) ?? 0) + 1);
+      throw new ScError(`Sin respuesta de SC (${(err as Error).name}).`, path, null);
+    }
+    consecutiveTimeouts.set(key, 0);
+
+    const raw = await r.text();
+    let body: unknown = null;
+    try {
+      body = raw ? JSON.parse(raw) : null;
+    } catch {
+      body = null;
+    }
+
+    if (!r.ok) {
+      const reason = failureReason(body) ?? raw.slice(0, 200);
+      lastErr = new ScError(`SC ${r.status}: ${reason}`, path, r.status);
+
+      // 401 = el token venció. Pasa de verdad: un backfill largo cruza los 120
+      // min de vida del token, y el que sale de Redis puede venir ya usado por
+      // otro proceso (el TTL de la clave no dice cuándo se emitió). Se descarta
+      // lo cacheado, se vuelve a loguear y se reintenta UNA vez. Sin esto, un
+      // token vencido convierte el resto de la corrida en 401 en cadena — nos
+      // costó 103 pólizas en un backfill.
+      if (r.status === 401 && !reauthed) {
+        reauthed = true;
+        continue;
+      }
+
+      // 4xx = contrato (ramo equivocado, servicio no habilitado): no se reintenta.
+      // El 429 es la excepción: SC tiene cuotas por ventana (3/s en el detalle,
+      // 1 cada 5 s en comisiones) y esperar alcanza. `Retry-After` si viene.
+      if (r.status < 500 && r.status !== 429) throw lastErr;
+      const retryAfter = Number(r.headers.get('retry-after'));
+      await sleep(retryAfter > 0 ? retryAfter * 1000 : 1000 * (attempt + 1) * (r.status === 429 ? 5 : 1));
+      continue;
+    }
+
+    const business = envelopeError(body);
+    if (business) throw new ScError(`SC 200 con HasError: ${business}`, path, r.status, true);
+
+    return body as T;
+  }
+  throw lastErr ?? new ScError('SC: agotados los reintentos.', path, null);
+}
+
+// ── Endpoints usados por la sync (todos de lectura) ───────────────────────────
+
+export interface ScProducerRef {
+  Producer: string;
+  Code: string;
+  TaxId: string;
+}
+
+/** Códigos de productor asociados al usuario B2B. Es el universo de la sync. */
+export function scProducers(): Promise<ScProducerRef[]> {
+  return scGet<ScProducerRef[]>('/api/User/producers-current-user');
+}
+
+export interface ScPortfolioPolicy {
+  State: string;
+  PolicyNumber: string;
+  InsuredName: string;
+  InsuredDocumentType: string;
+  InsuredDocument: string;
+  PolicyType: string;
+  ProducerCode: string;
+  OrganizerCode: string;
+  TypeOfContracting: string;
+}
+
+/** Cartera VIGENTE del código (WIKI §23). No trae histórico ni detalle financiero. */
+export async function scPortfolio(producerCode: string): Promise<ScPortfolioPolicy[]> {
+  const body = await scGet<{ Policies?: ScPortfolioPolicy[] }>(
+    `/api/Producer/portfolio-by-producer-code?producerCode=${encodeURIComponent(producerCode)}`,
+  );
+  return body.Policies ?? [];
+}
+
+/**
+ * Feed delta de cartera (WIKI §10): nº de pólizas con movimiento ESE día.
+ * Ventana dura de 30 días hacia atrás → hay que pollear al menos mensualmente.
+ * Es el sustituto de `Job/GetMovements`, que SC no nos tiene habilitado.
+ */
+export async function scMovementsByDate(taxId: string, producerCode: string, ymd: string): Promise<string[]> {
+  const qs = new URLSearchParams({ taxId, producerCode, date: ymd });
+  const body = await scGet<{ PolicyNumbers?: string[] }>(`/api/Producer/movements-by-date?${qs}`);
+  return body.PolicyNumbers ?? [];
+}
+
+export interface ScPaymentMovement {
+  Poliza: string;
+  Pagos: Array<{ Ext_ApplicationDate?: string; PaymentAmount?: string; ReversedDate?: string }>;
+}
+
+/** Feed delta de cobranzas (WIKI §11). Se consulta a día vencido. */
+export async function scPaymentsByDay(cuit: string, ymd: string): Promise<ScPaymentMovement[]> {
+  const qs = new URLSearchParams({ cuit, dia: ymd });
+  const body = await scGet<{ MovimientosCobranzas?: ScPaymentMovement[] }>(
+    `/api/Payment/ConsultaMovimientosCobranzaPorDia?${qs}`,
+  );
+  return body.MovimientosCobranzas ?? [];
+}
+
+/** Novedades de siniestros del día (WIKI §14): lista liviana de nº de siniestro. */
+export async function scClaimNews(producerCode: string, ymd: string): Promise<string[]> {
+  const qs = new URLSearchParams({ producerCode, newsDate: ymd });
+  const body = await scGet<string[] | { ClaimNumbers?: string[] }>(`/api/Claims/News?${qs}`);
+  if (Array.isArray(body)) return body;
+  return body.ClaimNumbers ?? [];
+}
+
+/** Detalle de un siniestro. `Claims/Producer` está deprecado: no usarlo. */
+export async function scClaimDetail(claimNumber: string): Promise<Record<string, unknown> | null> {
+  const body = await scGet<{ Claims?: Array<Record<string, unknown>> }>(
+    `/api/Claims/ClaimNumber?claimNumber=${encodeURIComponent(claimNumber)}`,
+  );
+  return body.Claims?.[0] ?? null;
+}
+
+/**
+ * Detalle de póliza por el endpoint del ramo. Devuelve el contenido YA
+ * desenvuelto: agro usa `PolicyDetails` (plural) y el resto `PolicyDetail`.
+ */
+export async function scPolicyDetail(endpoint: string, policyNumber: string): Promise<Record<string, unknown>> {
+  const path =
+    endpoint === 'GetPolicyDetailByPolicyNumber'
+      ? `/api/PolicyDetail/GetPolicyDetailByPolicyNumber?policyNumber=${encodeURIComponent(policyNumber)}&includePayments=true`
+      : `/api/PolicyDetail/${endpoint}?policyNumber=${encodeURIComponent(policyNumber)}`;
+  const body = await scGet<Record<string, unknown>>(path);
+  const detail = (body.PolicyDetail ?? body.PolicyDetails ?? body) as Record<string, unknown>;
+  if (!detail || typeof detail !== 'object') throw new ScError('Detalle de póliza vacío.', path, 200, true);
+  return detail;
+}

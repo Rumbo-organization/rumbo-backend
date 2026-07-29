@@ -1387,3 +1387,137 @@ export const calendarEvents = pgTable(
   },
   table => [index('calendar_events_org_date_idx').on(table.orgId, table.date)],
 );
+
+// ── Sync con aseguradoras (jul-2026, doc 18) ─────────────────────────────────
+//
+// Primera implementación real de la costura `source='sync'` que D-019 dejó
+// reservada: el gateway B2B de San Cristóbal. Tres tablas de INFRAESTRUCTURA
+// del job (no son datos de negocio; el negocio cae en `policies`, `contacts`,
+// `claims`, etc.):
+//
+//   · `insurer_sync_state` — hasta qué día se leyó cada feed, por código.
+//   · `insurer_sync_queue` — nº de póliza/siniestro pendientes de traer detalle.
+//   · `insurer_sync_runs`  — bitácora de corridas.
+//
+// La cola existe porque el detalle está limitado a 3 req/s y una invocación
+// serverless tiene segundos: cada corrida drena lo que puede y la siguiente
+// sigue donde quedó. Es el patrón "feed liviano → cola → detalle" que describe
+// la propia metodología de SC (WIKI §9).
+//
+// Aislamiento: las tres son org-scoped y de SOLO LECTURA para `authenticated`
+// (el cockpit puede mostrar el estado de la sync). Escribe únicamente el job,
+// que corre con el cliente owner y bypassea RLS.
+
+// Qué feed avanzó hasta cuándo. Grano: (org, aseguradora, código de productor).
+export const insurerSyncState = pgTable(
+  'insurer_sync_state',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    orgId: uuid('org_id')
+      .notNull()
+      .references(() => organizations.id, { onDelete: 'cascade' }),
+    insurerId: uuid('insurer_id')
+      .notNull()
+      .references(() => insurers.id, { onDelete: 'cascade' }),
+    /** Código del PAS en la aseguradora (`04-006223`), no el uuid del productor. */
+    producerCode: text('producer_code').notNull(),
+    /** CUIT del productor: lo piden los feeds de movimientos y de cobranzas. */
+    taxId: text('tax_id'),
+
+    // Cursores: último día YA procesado de cada feed. Se avanzan de a un día
+    // para que una caída de varios días se recupere sola. SC solo permite mirar
+    // 30 días atrás, así que un hueco más largo que eso se pierde — por eso el
+    // cron es diario y no semanal.
+    lastMovementDate: date('last_movement_date'),
+    lastPaymentDate: date('last_payment_date'),
+    lastClaimsNewsDate: date('last_claims_news_date'),
+    /** Última vez que se hizo el barrido completo de cartera vigente. */
+    lastPortfolioAt: timestamp('last_portfolio_at', { withTimezone: true }),
+
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  table => [
+    index('insurer_sync_state_org_idx').on(table.orgId),
+    uniqueIndex('insurer_sync_state_code_idx').on(table.orgId, table.insurerId, table.producerCode),
+  ],
+);
+
+export const syncQueueKind = pgEnum('sync_queue_kind', ['policy', 'claim']);
+
+// Cola de detalles pendientes. `done_at IS NULL` = pendiente; el único parcial
+// sobre los pendientes evita encolar dos veces la misma póliza en un mismo día.
+export const insurerSyncQueue = pgTable(
+  'insurer_sync_queue',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    orgId: uuid('org_id')
+      .notNull()
+      .references(() => organizations.id, { onDelete: 'cascade' }),
+    insurerId: uuid('insurer_id')
+      .notNull()
+      .references(() => insurers.id, { onDelete: 'cascade' }),
+    kind: syncQueueKind('kind').notNull(),
+    /** Nº de póliza o de siniestro en la aseguradora. */
+    externalRef: text('external_ref').notNull(),
+    /** Código del PAS que originó el ítem (para atribuir la póliza al productor). */
+    producerCode: text('producer_code'),
+    /** Por qué se encoló: `portfolio`, `movement`, `payment`, `claim_news`, `retry`. */
+    reason: text('reason').notNull(),
+
+    attempts: integer('attempts').notNull().default(0),
+    lastError: text('last_error'),
+    /** Fecha del feed que lo encoló (para reprocesar un día puntual). */
+    feedDate: date('feed_date'),
+
+    enqueuedAt: timestamp('enqueued_at', { withTimezone: true }).notNull().defaultNow(),
+    doneAt: timestamp('done_at', { withTimezone: true }),
+  },
+  table => [
+    index('insurer_sync_queue_org_idx').on(table.orgId),
+    // El drenado toma los pendientes más viejos con menos intentos.
+    index('insurer_sync_queue_pending_idx').on(table.orgId, table.doneAt, table.attempts),
+    uniqueIndex('insurer_sync_queue_pending_ref_idx')
+      .on(table.orgId, table.insurerId, table.kind, table.externalRef)
+      .where(sql`done_at IS NULL`),
+  ],
+);
+
+export const syncRunMode = pgEnum('sync_run_mode', ['backfill', 'incremental']);
+export const syncRunStatus = pgEnum('sync_run_status', ['running', 'ok', 'error']);
+
+// Bitácora de corridas: la evidencia de que el cron corrió y qué hizo.
+export const insurerSyncRuns = pgTable(
+  'insurer_sync_runs',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    orgId: uuid('org_id')
+      .notNull()
+      .references(() => organizations.id, { onDelete: 'cascade' }),
+    insurerId: uuid('insurer_id')
+      .notNull()
+      .references(() => insurers.id, { onDelete: 'cascade' }),
+    mode: syncRunMode('mode').notNull(),
+    status: syncRunStatus('status').notNull().default('running'),
+    /** Contadores de la corrida: encolados, procesados, fallidos, escritos por tabla. */
+    counters: jsonb('counters').$type<Record<string, number>>().notNull().default({}),
+    /** Endpoints que abrieron el breaker + primer error, si la corrida falló. */
+    notes: text('notes'),
+
+    startedAt: timestamp('started_at', { withTimezone: true }).notNull().defaultNow(),
+    /** Latido: lo bumpea el job mientras avanza. El reaper de corridas colgadas
+     *  mira esto y no `started_at` — un backfill legítimo puede durar horas. */
+    heartbeatAt: timestamp('heartbeat_at', { withTimezone: true }).notNull().defaultNow(),
+    finishedAt: timestamp('finished_at', { withTimezone: true }),
+  },
+  table => [
+    index('insurer_sync_runs_org_idx').on(table.orgId, table.startedAt),
+    // Mutex de la sync: una corrida en vuelo por (org, aseguradora). El índice
+    // parcial ES el candado. No se usa `pg_try_advisory_lock` porque la app
+    // habla con el endpoint pooled de Neon (PgBouncer, transaction pooling),
+    // donde los locks de sesión no aíslan nada.
+    uniqueIndex('insurer_sync_runs_one_running_idx')
+      .on(table.orgId, table.insurerId)
+      .where(sql`status = 'running'`),
+  ],
+);

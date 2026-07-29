@@ -1,4 +1,4 @@
-import { eq } from 'drizzle-orm';
+import { desc, eq } from 'drizzle-orm';
 
 import { db, schema } from './db/client.js';
 
@@ -21,10 +21,27 @@ function slugify(s: string): string {
 // esa org sin crear nada. Corre sobre la conexión owner (bypassea RLS): antes de
 // que exista la org no hay claims que satisfagan las policies.
 export async function ensureUserOrg(userId: string): Promise<string> {
+  // ⚠️ El `ORDER BY` no es cosmético. Este valor termina en
+  // `session.activeOrganizationId` (auth.ts, hook `session.create.before`), o
+  // sea que decide en qué organización aterriza el usuario en CADA login. Sin
+  // orden explícito, `limit 1` sobre varias memberships devuelve una fila
+  // arbitraria: Postgres no garantiza orden, y el mismo usuario puede caer en
+  // una org distinta según el plan de query o después de un UPDATE/VACUUM.
+  //
+  // Con D-019 (organizador-first) pertenecer a varias orgs es lo normal —un PAS
+  // invitado a la organización de su organizador—, así que esto pasa de rareza
+  // a caso común.
+  //
+  // Criterio: la membership MÁS RECIENTE. A quien lo invitaron a una
+  // organización, esa es la que vino a usar; su propia org de onboarding queda
+  // a un clic en el switcher. Es un default, no una preferencia: el "org por
+  // defecto" elegido por el usuario es una feature aparte (haría falta
+  // persistirlo, hoy no existe en el modelo).
   const [existing] = await db
     .select({ orgId: schema.members.organizationId })
     .from(schema.members)
     .where(eq(schema.members.userId, userId))
+    .orderBy(desc(schema.members.createdAt))
     .limit(1);
   if (existing) return existing.orgId;
 

@@ -99,16 +99,17 @@ const STALE_RUN_MINUTES = 15;
 /**
  * Pólizas cuyo detalle se pide en paralelo.
  *
- * El cuello de la sync **no es el rate limit, es la latencia**: SC tarda ~30 s
- * por detalle y permite 3 req/s, así que yendo de a uno se usa el ~1% del caudal
- * autorizado y un backfill de 125 pólizas se va a más de una hora. Con N en
- * vuelo el reloj se divide por N y el promedio sigue muy por debajo del límite
- * (3 × 30 s ⇒ ~0,1 req/s). El token bucket del cliente sigue acotando el pico.
+ * **Default 1, y con razón.** Creímos que el cuello era la latencia de SC
+ * (~30 s por detalle) y que paralelizar lo dividía. Falso: esos 30 s eran la
+ * CUOTA. El gateway lo dice en el 429 — *"Máximo permitido: 1 por 30s"* — o sea
+ * 90× más estricto que los 3 req/s que documenta su WIKI. Con N en paralelo,
+ * N−1 llamadas se comen un 429.
  *
- * Default deliberadamente bajo: SC ya nos bloqueó una vez. Subirlo **solo** con
- * el OK de la Mesa de Servicios sobre cuántas consultas concurrentes aceptan.
+ * El detalle es serial por definición del proveedor y no hay nada del lado
+ * nuestro que lo acelere. Subir esto solo tiene sentido si SC confirma que la
+ * cuota es POR ENDPOINT (entonces conviene intercalar ramos) o si la levanta.
  */
-const CONCURRENCY = Math.max(1, Number(process.env.SC_CONCURRENCY ?? 3));
+const CONCURRENCY = Math.max(1, Number(process.env.SC_CONCURRENCY ?? 1));
 
 export type SyncMode = 'backfill' | 'incremental';
 

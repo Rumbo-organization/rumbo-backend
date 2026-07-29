@@ -110,7 +110,52 @@ export function isTransient(err: unknown): boolean {
   return err.status === null || UPSTREAM_DOWN.test(err.message);
 }
 
-// ── Rate limiting (token bucket global al proceso) ────────────────────────────
+// ── Rate limiting ─────────────────────────────────────────────────────────────
+//
+// ⚠️ Lo que SC documenta y lo que SC aplica NO coinciden. La WIKI dice 3 req/s
+// para el detalle de póliza; lo que devuelve el gateway cuando te pasás es:
+//
+//   429 — "Cuota excedida. Máximo permitido: 1 por 30s."
+//
+// Noventa veces más estricto. De ahí salía el "~32 s por póliza" que medimos y
+// leímos como latencia del backend: no era latencia, era la cuota. Por eso el
+// backfill secuencial funcionaba (1 cada ~32 s, apenas por debajo) y por eso
+// pedir de a 3 en paralelo produce 429 en dos de cada tres.
+//
+// Consecuencia dura: **el detalle no se puede acelerar**. 125 pólizas ≈ 1 h,
+// 990 (la cartera real de Pablo) ≈ 8 h. Solo lo cambia que SC suba la cuota.
+
+/** Intervalo mínimo entre llamadas al MISMO endpoint, en ms. */
+const MIN_INTERVAL_MS: Array<[RegExp, number]> = [
+  // Cuota real observada en UAT (29-jul-2026). +2 s de margen: el 429 dice
+  // "inténtalo de nuevo en 29 segundo(s)" y no queremos rozar el borde.
+  [/^\/api\/PolicyDetail\//, 32_000],
+  // §13 del doc, y el 429 lo confirma con el mismo formato de mensaje.
+  [/^\/api\/Producer\/earned-commissions-paginated/, 5_000],
+  [/^\/api\/Report/, 10_000],
+];
+
+const lastCallAt = new Map<string, number>();
+
+function minInterval(path: string): number {
+  return MIN_INTERVAL_MS.find(([re]) => re.test(path))?.[1] ?? 0;
+}
+
+/** Espera lo que falte para respetar la cuota por endpoint. */
+async function waitForEndpoint(path: string): Promise<void> {
+  const interval = minInterval(path);
+  if (interval === 0) return;
+  const key = breakerKey(path);
+  for (;;) {
+    const last = lastCallAt.get(key) ?? 0;
+    const wait = last + interval - Date.now();
+    if (wait <= 0) break;
+    await sleep(wait);
+  }
+  lastCallAt.set(key, Date.now());
+}
+
+// ── Token bucket global al proceso (tope de pico, además de lo de arriba) ─────
 
 let tokens = RATE_PER_SEC;
 let lastRefill = Date.now();
@@ -248,6 +293,7 @@ export async function scGet<T>(path: string): Promise<T> {
   let lastErr: ScError | null = null;
   let reauthed = false;
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    await waitForEndpoint(path);
     await takeToken();
     const token = await getToken(reauthed);
     let r: Response;

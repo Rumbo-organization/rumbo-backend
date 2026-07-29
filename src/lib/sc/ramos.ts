@@ -15,7 +15,7 @@
 // Confirmados contra UAT el 28-jul-2026: 02→fire, 06→personal-accidents,
 // 07→combined, 11→general-liability, 17→life. El resto sale del doc §12.
 
-import { isWrongRamo, scPolicyDetail } from './client.js';
+import { isTripped, isWrongRamo, scPolicyDetail } from './client.js';
 
 /** Valores del enum `policy_ramo` (src/db/schema.ts). */
 export type RumboRamo =
@@ -108,7 +108,13 @@ export async function fetchDetailByRamo(policyNumber: string): Promise<ResolvedD
   }
 
   const code = ramoCode(policyNumber);
-  const candidates = [...Object.values(BY_RAMO_CODE), ...UNMAPPED_ENDPOINTS];
+  // Se saltean los endpoints ya cortados: si no, la sonda choca contra el
+  // breaker de OTRO ramo (`combined` cuelga siempre) y aborta antes de llegar al
+  // que corresponde — el ramo nuevo se queda sin descubrir y gasta intentos por
+  // un problema que no es suyo. Pasó con el ramo 15.
+  const candidates = [...Object.values(BY_RAMO_CODE), ...UNMAPPED_ENDPOINTS].filter(
+    c => !isTripped(`/api/PolicyDetail/${c.endpoint}`),
+  );
   for (const candidate of candidates) {
     try {
       const detail = await scPolicyDetail(candidate.endpoint, policyNumber);

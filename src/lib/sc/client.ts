@@ -28,8 +28,19 @@ const BASE_URLS = {
 
 export type ScEnv = keyof typeof BASE_URLS;
 
-/** Timeout por request. El detalle de algunos ramos tarda decenas de segundos. */
-const REQUEST_TIMEOUT_MS = 45_000;
+/**
+ * Timeout por request.
+ *
+ * Estaba en 45 s y **era demasiado justo**: hay pólizas que SC responde bien
+ * pero en ~43 s (medido: 42,8 s y 41,5 s en dos que venían fallando corrida
+ * tras corrida). Pasaban raspando y cualquier variación las tiraba, así que
+ * parecían "SC inestable" cuando en realidad las estábamos cortando nosotros.
+ *
+ * A 90 s entran con margen. Lo que encarece es el endpoint que cuelga de verdad
+ * (`combined`): 3 intentos × 90 s antes de que abra el breaker. Son ~4 min de
+ * una corrida de 32, y solo la primera vez.
+ */
+const REQUEST_TIMEOUT_MS = Number(process.env.SC_TIMEOUT_MS ?? 90_000);
 /** Reintentos ante 5xx/timeout (el 4xx no se reintenta: es contrato, no clima). */
 const MAX_RETRIES = 2;
 /**
@@ -195,6 +206,11 @@ export function resetBreaker(): void {
 }
 
 const BREAKER_MSG = 'Breaker abierto para';
+
+/** ¿Este endpoint ya está cortado en esta corrida? Lo consulta la sonda de ramo. */
+export function isTripped(path: string): boolean {
+  return (consecutiveTimeouts.get(breakerKey(path)) ?? 0) >= BREAKER_THRESHOLD;
+}
 
 /**
  * El fallo fue el corte local, no un intento real contra SC. A diferencia de un

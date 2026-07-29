@@ -371,27 +371,92 @@ quotesRouter.get(
   '/vehiculos',
   wrap(async (req, res) => {
     const q = String((req.query.q ?? '') as string).trim();
+    const marca = String((req.query.marca ?? '') as string).trim();
+    const modelo = String((req.query.modelo ?? '') as string).trim();
     const ctx = req.authCtx!;
-    const rows = await withAuthedTx(ctx, tx =>
-      tx.execute(sql`
-        SELECT DISTINCT ON (data->>'InfoAutoCode')
-               data->>'InfoAutoCode'  AS "infoautoCode",
-               data->>'BrandName'     AS marca,
-               data->>'ModelName'     AS modelo,
-               data->>'VersionName'   AS version,
-               (data->>'Year')::int   AS anio,
-               data->>'Usage'         AS uso,
-               data->>'Category'      AS categoria,
-               data->>'FuelType'      AS combustible,
-               (data->>'StatedAmount')::numeric AS "sumaAsegurada"
+
+    // Una sola llamada devuelve los tres niveles de la cascada: las marcas
+    // disponibles, los modelos de la marca elegida y las versiones concretas.
+    // Marca y modelo son datos estructurados, no texto libre — así se cotiza en
+    // el portal de cualquier compañía, y evita que un typo deje sin resultados.
+    // `q` queda como atajo para buscar por patente, que es como el PAS suele
+    // identificar un auto que ya asegura.
+    const out = await withAuthedTx(ctx, async tx => {
+      const marcas = await tx.execute<{ marca: string; n: number }>(sql`
+        SELECT data->>'BrandName' AS marca, count(*)::int AS n
           FROM policy_risks
-         WHERE data->>'InfoAutoCode' IS NOT NULL
-           AND (${q} = '' OR concat_ws(' ', data->>'BrandName', data->>'ModelName', data->>'VersionName', patente)
-                            ILIKE ${'%' + q + '%'})
-         ORDER BY data->>'InfoAutoCode', (data->>'Year')::int DESC
-         LIMIT 40`),
-    );
-    res.json({ vehiculos: rows.rows });
+         WHERE data->>'InfoAutoCode' IS NOT NULL AND data->>'BrandName' IS NOT NULL
+         GROUP BY 1 ORDER BY 1`);
+
+      const modelos = marca
+        ? await tx.execute<{ modelo: string; n: number }>(sql`
+            SELECT data->>'ModelName' AS modelo, count(*)::int AS n
+              FROM policy_risks
+             WHERE data->>'InfoAutoCode' IS NOT NULL
+               AND data->>'BrandName' = ${marca}
+               AND data->>'ModelName' IS NOT NULL
+             GROUP BY 1 ORDER BY 1`)
+        : { rows: [] };
+
+      // Las versiones solo se listan cuando ya hay por dónde acotar: sin filtro
+      // ni búsqueda, devolver la lista entera no ayuda a elegir.
+      const hayFiltro = Boolean(marca || q);
+      const vehiculos = hayFiltro
+        ? await tx.execute(sql`
+            SELECT DISTINCT ON (data->>'InfoAutoCode')
+                   data->>'InfoAutoCode'  AS "infoautoCode",
+                   data->>'BrandName'     AS marca,
+                   data->>'ModelName'     AS modelo,
+                   data->>'VersionName'   AS version,
+                   (data->>'Year')::int   AS anio,
+                   data->>'Usage'         AS uso,
+                   data->>'Category'      AS categoria,
+                   data->>'FuelType'      AS combustible,
+                   (data->>'StatedAmount')::numeric AS "sumaAsegurada",
+                   patente
+              FROM policy_risks
+             WHERE data->>'InfoAutoCode' IS NOT NULL
+               AND (${marca} = '' OR data->>'BrandName' = ${marca})
+               AND (${modelo} = '' OR data->>'ModelName' = ${modelo})
+               AND (${q} = '' OR concat_ws(' ', data->>'BrandName', data->>'ModelName',
+                                           data->>'VersionName', patente) ILIKE ${'%' + q + '%'})
+             ORDER BY data->>'InfoAutoCode', (data->>'Year')::int DESC
+             LIMIT 60`)
+        : { rows: [] };
+
+      return { marcas: marcas.rows, modelos: modelos.rows, vehiculos: vehiculos.rows };
+    });
+    res.json(out);
+  }),
+);
+
+// Catálogos que necesita el formulario de cotización, en una sola llamada.
+//
+// Van acá y no hardcodeados en el front por dos razones: los códigos son de la
+// aseguradora (la provincia viaja como `AR_17`, no como "Neuquén") y cambian sin
+// avisarnos. Pedirle al PAS que tipee un código interno era pedirle que adivine.
+quotesRouter.get(
+  '/cotizador/catalogos',
+  wrap(async (_req, res) => {
+    if (!isScConfigured()) {
+      res.status(503).json({ error: 'La cotización en vivo no está configurada.' });
+      return;
+    }
+    try {
+      const { scGet } = await import('../lib/sc/client.js');
+      const [prov, usos] = await Promise.all([
+        scGet<{ States?: Array<{ Code: string; Description: string }> }>(
+          '/api/ClaimCatalog/states-by-country?countryCode=AR',
+        ),
+        scGet<{ Values?: Array<{ Code: string; Description: string }> }>('/api/TypeList/Usage'),
+      ]);
+      res.json({
+        provincias: (prov.States ?? []).map(x => ({ code: x.Code, label: x.Description })),
+        usos: (usos.Values ?? []).map(x => ({ code: x.Code, label: x.Description })),
+      });
+    } catch (err) {
+      res.status(502).json({ error: `No se pudieron traer los catálogos: ${(err as Error).message}` });
+    }
   }),
 );
 
@@ -484,6 +549,11 @@ quotesRouter.post(
       statedAmount: num(b.statedAmount) ?? undefined,
       postalCode: num(b.postalCode) ?? undefined,
       state: typeof b.state === 'string' ? b.state : undefined,
+      // El uso cambia la tarifa (personal vs comercial vs taxi). Viene
+      // prellenado del vehículo, pero el PAS puede cotizar otro escenario.
+      usage: typeof b.usage === 'string' && b.usage ? b.usage : undefined,
+      category: typeof b.category === 'string' && b.category ? b.category : undefined,
+      fuelType: typeof b.fuelType === 'string' && b.fuelType ? b.fuelType : undefined,
     };
     // El código de productor no lo tipea el PAS: lo sabe la base. Se toma el del
     // productor dueño de la org (`is_self`) para esa aseguradora, que es el que

@@ -50,6 +50,7 @@ const BY_RAMO_CODE: Record<string, RamoRoute> = {
   '06': { endpoint: 'personal-accidents', ramo: 'accidentes_personales' },
   '07': { endpoint: 'combined', ramo: 'hogar' }, // se refina por PolicyType, abajo.
   '11': { endpoint: 'general-liability', ramo: 'responsabilidad_civil' },
+  '15': { endpoint: 'technical', ramo: 'seguro_tecnico' }, // descubierto por sonda, 29-jul-2026.
   '17': { endpoint: 'life', ramo: 'vida' },
   '19': { endpoint: 'burial', ramo: 'otros' }, // Sepelio.
 };
@@ -57,7 +58,6 @@ const BY_RAMO_CODE: Record<string, RamoRoute> = {
 /** Endpoints del Swagger cuyo nº de ramo todavía no vimos en la cartera real. */
 const UNMAPPED_ENDPOINTS: RamoRoute[] = [
   { endpoint: 'transport', ramo: 'transporte' },
-  { endpoint: 'technical', ramo: 'seguro_tecnico' },
   { endpoint: 'hull-and-aircraft', ramo: 'embarcaciones' },
   { endpoint: 'caution', ramo: 'otros' }, // Caución.
   { endpoint: 'agriculture', ramo: 'otros' }, // Agropecuario.

@@ -194,9 +194,32 @@ export function mapPolicyStatus(detail: Rec, today = new Date()): RumboPolicySta
   if (raw.includes('cancel') || raw.includes('anul') || rec(detail.ReasonsCancellation)) return 'anulada';
   if (str(detail.NextPolicy)) return 'renovada';
   if (raw.includes('propuesta') || raw.includes('cotiz')) return 'propuesta';
+  // Automotor informa "Expiró" con una vigencia que todavía no terminó (la
+  // fecha de fin es la del período nuevo). Manda lo que dice SC.
+  if (raw.includes('expir') || raw.includes('venc')) return 'vencida';
   const end = ymd(detail.PeriodEnd);
   if (end && end < today.toISOString().slice(0, 10)) return 'vencida';
   return 'vigente';
+}
+
+/**
+ * Nº de póliza. **Automotor no trae `PolicyNumber`** — es el único ramo así, y
+ * sin él la póliza queda sin `external_ref`, o sea sin la identidad que le da
+ * idempotencia (el índice único es parcial sobre `external_ref IS NOT NULL`:
+ * cada corrida insertaría un duplicado). Se cae en cascada:
+ *   1. `PolicyNumber` cuando está;
+ *   2. `JobNumber` sin el sufijo de endoso (`01-04-01-30772228-1` → sin `-1`);
+ *   3. el número que pedimos, que siempre conocemos.
+ */
+export function resolvePolicyNumber(detail: Rec, requested?: string | null): string | null {
+  const direct = str(detail.PolicyNumber);
+  if (direct) return direct;
+  const job = str(detail.JobNumber);
+  if (job) {
+    const parts = job.split('-');
+    if (parts.length >= 5) return parts.slice(0, 4).join('-');
+  }
+  return requested?.trim() || null;
 }
 
 /** `responsive` = efectivo/cupón; los otros dos son literales del enum de SC. */
@@ -219,16 +242,20 @@ function mapPaymentMethod(detail: Rec): MappedPolicy['paymentMethod'] {
  * `TotalCost` el PREMIO (lo que paga el asegurado, con impuestos). El export
  * XLSX solo traía el premio — la prima neta solo sale por acá.
  */
-export function mapPolicy(detail: Rec, ramo: RumboRamo): MappedPolicy {
+export function mapPolicy(detail: Rec, ramo: RumboRamo, requestedNumber?: string | null): MappedPolicy {
   const cancellation = rec(detail.ReasonsCancellation);
+  // Automotor tampoco trae los totales de cabecera: los acumulados viven en la
+  // última transacción (`TotalPremiumRPT`/`TotalCostRPT`, ya acumulados hasta
+  // ella — a diferencia de `Transaction*Rpt`, que es el delta del movimiento).
+  const lastTx = arr(detail.Transactions).at(-1) ?? {};
   return {
-    policyNumber: str(detail.PolicyNumber) as string,
+    policyNumber: resolvePolicyNumber(detail, requestedNumber) as string,
     ramo,
     status: mapPolicyStatus(detail),
     startDate: ymd(detail.PeriodStart),
     endDate: ymd(detail.PeriodEnd),
-    prima: money(detail.TotalPremium),
-    premio: money(detail.TotalCost),
+    prima: money(detail.TotalPremium) ?? money(lastTx.TotalPremiumRPT),
+    premio: money(detail.TotalCost) ?? money(lastTx.TotalCostRPT),
     currency: (
       code(arr(detail.PreferredCoverageCurrencies).find(c => c.Selected === true)?.Code) ?? 'ars'
     ).toUpperCase(),
@@ -398,12 +425,27 @@ function scalars(o: Rec): Rec {
 export function mapRisks(detail: Rec): MappedRisk[] {
   const out: MappedRisk[] = [];
 
-  const vehicles = arr(detail.Vehicles).length ? arr(detail.Vehicles) : [rec(detail.Vehicle)].filter(Boolean as never);
-  for (const v of vehicles as Rec[]) {
+  // Automotor: `Vehicle` (singular) en póliza individual, `FleetOfVehicles` en
+  // flota. Nombres verificados contra el payload real — son `BrandName` /
+  // `ModelName` / `VersionName`, no `Make` / `Model` como se había asumido.
+  const vehicles = [
+    ...arr(detail.Vehicles),
+    ...arr(detail.FleetOfVehicles),
+    ...(rec(detail.Vehicle) ? [rec(detail.Vehicle) as Rec] : []),
+  ];
+  for (const v of vehicles) {
     const patente = str(v.LicensePlate) ?? str(v.Plate) ?? str(v.Ext_LicensePlate);
+    const descripcion = [
+      str(v.BrandName) ?? str(v.Make),
+      str(v.ModelName) ?? str(v.Model),
+      str(v.VersionName),
+      str(v.Year),
+    ]
+      .filter(Boolean)
+      .join(' ');
     out.push({
       patente,
-      descripcion: [str(v.Make), str(v.Model), str(v.Year)].filter(Boolean).join(' ') || patente,
+      descripcion: descripcion || patente,
       data: scalars(v),
       externalRef: str(v.PublicId) ?? patente,
     });

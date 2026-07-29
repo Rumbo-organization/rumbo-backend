@@ -62,6 +62,7 @@ import {
   mapPortfolioContact,
   mapRisks,
   primaryContact,
+  resolvePolicyNumber,
   type MappedContact,
 } from './lib/sc/map.js';
 import { fetchDetailByRamo, knownRoute, ramoCode, refineRamo, type RumboRamo } from './lib/sc/ramos.js';
@@ -410,7 +411,7 @@ async function upsertContactLocked(ctx: Ctx, mapped: MappedContact, producerId: 
  */
 async function syncPolicy(ctx: Ctx, policyNumber: string, producerCodeHint: string | null): Promise<void> {
   const { detail, ramo } = await fetchDetailByRamo(policyNumber);
-  await writePolicy(ctx, detail, ramo, producerCodeHint);
+  await writePolicy(ctx, detail, ramo, producerCodeHint, policyNumber);
 }
 
 /**
@@ -425,11 +426,17 @@ async function writePolicy(
   detail: Record<string, unknown>,
   ramo: RumboRamo,
   producerCodeHint: string | null,
+  /** El nº que pedimos. Automotor no lo trae en el payload (ver map.ts). */
+  requestedNumber?: string | null,
 ): Promise<void> {
-  const policyNumber = String(detail.PolicyNumber ?? '');
   const policyType =
     (detail.Ext_PolicyType as { Code?: string } | undefined)?.Code ?? (detail.PolicyType as string | undefined);
-  const mapped = mapPolicy(detail, refineRamo(ramo, policyType ?? null));
+  const mapped = mapPolicy(detail, refineRamo(ramo, policyType ?? null), requestedNumber);
+  const policyNumber = mapped.policyNumber;
+  // Sin nº no hay `external_ref`, y sin `external_ref` no hay idempotencia: el
+  // índice único es parcial sobre `external_ref IS NOT NULL`, así que cada
+  // corrida insertaría un duplicado en silencio. Mejor fallar y reintentar.
+  if (!policyNumber) throw new Error('Detalle sin nº de póliza resoluble (ni PolicyNumber ni JobNumber).');
   const producerCode = mapped.producerCode ?? producerCodeHint;
   const producerId = producerCode ? (ctx.producerByCode.get(producerCode) ?? null) : null;
 
@@ -1074,7 +1081,7 @@ export async function replayStoredPolicies(
     for (;;) {
       const detail = pending.shift();
       if (!detail) return;
-      const number = String(detail.PolicyNumber ?? '');
+      const number = resolvePolicyNumber(detail) ?? '';
       const route = knownRoute(number);
       if (!route) {
         ctx.notes.push(`Ramo ${ramoCode(number)} sin mapear: ${number}`);
@@ -1082,7 +1089,7 @@ export async function replayStoredPolicies(
         continue;
       }
       try {
-        await writePolicy(ctx, detail, route.ramo, null);
+        await writePolicy(ctx, detail, route.ramo, null, number);
       } catch (err) {
         ctx.notes.push(`${number}: ${err instanceof Error ? err.message : String(err)}`);
         bump(ctx, 'failed');

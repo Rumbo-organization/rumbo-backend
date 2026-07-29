@@ -1419,7 +1419,7 @@ export const insurerSyncState = pgTable(
     insurerId: uuid('insurer_id')
       .notNull()
       .references(() => insurers.id, { onDelete: 'cascade' }),
-    /** Código del PAS en la aseguradora (`04-006223`), no el uuid del productor. */
+    /** Código del PAS en la aseguradora (formato `99-999999`), no el uuid del productor. */
     producerCode: text('producer_code').notNull(),
     /** CUIT del productor: lo piden los feeds de movimientos y de cobranzas. */
     taxId: text('tax_id'),

@@ -16,7 +16,7 @@
 //     2/s (margen) con un token bucket global al proceso.
 //
 // Verificado contra UAT el 28-jul-2026. Endpoints confirmados deshabilitados
-// para el usuario `B2B_Rumbo`: `Job/GetMovements`, `Producer/producer-promises`,
+// para nuestro usuario integrador: `Job/GetMovements`, `Producer/producer-promises`,
 // `Producer/earned-commissions-paginated` (ver §9 del doc).
 
 import { isRedisConfigured, redisGet, redisSet } from '../../redis.js';
@@ -107,7 +107,7 @@ export function isBlocked(err: unknown): boolean {
 // El gateway de SC devuelve 400 cuando el que se cayó es su propio backend, así
 // que por status no se distingue de un error de contrato. Las tres formas que
 // vimos en UAT: el PolicyCenter caído, un fallo de red del gateway hacia él, y
-// un 500 de IBM_HTTP_Server que vuelve como HTML y rompe el binding SOAP.
+// un 500 de su servidor web que vuelve como HTML y rompe el binding SOAP.
 const UPSTREAM_DOWN =
   /is unavailable|error occurred while sending the request|does not match the content type|Internal Server Error/i;
 

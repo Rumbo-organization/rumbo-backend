@@ -187,6 +187,8 @@ quotesRouter.get(
         ramo: RAMO_LABELS[q.ramo] ?? q.ramo,
         reference: q.reference,
         vehicle: [q.vehicleMarca, q.vehicleModelo, q.vehicleVersion, q.vehicleAnio].filter(Boolean).join(' ') || null,
+        // Datos de rating del vehículo: permiten cotizar sin volver a elegirlo.
+        details: q.details ?? null,
         notes: q.notes,
         date: q.createdAt.toISOString().slice(0, 10),
         items: items.map(({ it, insurerName }) => ({
@@ -197,6 +199,16 @@ quotesRouter.get(
           coverageLabel: it.coverage ? (NORMALIZED_COVERAGE_LABELS[it.coverage] ?? it.coverage) : null,
           sumaAsegurada: it.sumaAsegurada == null ? null : Number(it.sumaAsegurada),
           cuota: it.cuota == null ? null : Number(it.cuota),
+          prima: it.prima == null ? null : Number(it.prima),
+          premio: it.premio == null ? null : Number(it.premio),
+          // La franquicia distingue opciones que si no se verían idénticas: la
+          // aseguradora devuelve cuatro Todo Riesgo con el mismo código y solo
+          // cambia esto (y el precio).
+          deductible: it.deductible,
+          nativeCode: it.nativeCode,
+          // Para que la UI pueda distinguir lo que trajo la API de lo cargado
+          // a mano: recotizar reemplaza lo primero y respeta lo segundo.
+          source: it.source,
           currency: it.currency,
         })),
       };
@@ -239,6 +251,10 @@ quotesRouter.post(
           vehicleAnio: optionalText(b.vehicleAnio, 8),
           vehicleVersion: optionalText(b.vehicleVersion, 120),
           notes: optionalText(b.notes, 500),
+          // Datos de rating del vehículo elegido (código Infoauto, uso, suma…).
+          // Se guardan al crear para que cotizar después no obligue a volver a
+          // elegir el auto: es el mismo dato, pedido una sola vez.
+          details: b.details && typeof b.details === 'object' ? (b.details as Record<string, unknown>) : null,
           source: 'manual' as const,
         })
         .returning({ id: quotes.id });

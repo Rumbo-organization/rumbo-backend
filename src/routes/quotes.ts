@@ -352,6 +352,102 @@ quotesRouter.post(
   }),
 );
 
+// ── Catálogo de vehículos ────────────────────────────────────────────────────
+//
+// Para cotizar, San Cristóbal exige el **código Infoauto**: es excluyente y no
+// hay alternativa. Pero el PAS piensa en "Toyota Corolla XEI", no en 360835, y
+// SC solo ofrece búsqueda POR código — no por marca o modelo.
+//
+// El puente sale de la propia cartera sincronizada: cada auto trae su código
+// junto a marca, modelo, versión, año y suma asegurada. Cubre el caso más común
+// de un PAS con cartera —recotizar o renovar algo que ya asegura— y el catálogo
+// crece solo con cada sync.
+//
+// ⚠️ **No cubre un vehículo que nunca aseguró.** Para eso hace falta el padrón
+// de Infoauto (licencia aparte) o que SC exponga un catálogo navegable. Por eso
+// existe también la validación por código de abajo: si el PAS lo consigue por
+// otro lado, puede tipearlo y confirmar que es el correcto antes de cotizar.
+quotesRouter.get(
+  '/vehiculos',
+  wrap(async (req, res) => {
+    const q = String((req.query.q ?? '') as string).trim();
+    const ctx = req.authCtx!;
+    const rows = await withAuthedTx(ctx, tx =>
+      tx.execute(sql`
+        SELECT DISTINCT ON (data->>'InfoAutoCode')
+               data->>'InfoAutoCode'  AS "infoautoCode",
+               data->>'BrandName'     AS marca,
+               data->>'ModelName'     AS modelo,
+               data->>'VersionName'   AS version,
+               (data->>'Year')::int   AS anio,
+               data->>'Usage'         AS uso,
+               data->>'Category'      AS categoria,
+               data->>'FuelType'      AS combustible,
+               (data->>'StatedAmount')::numeric AS "sumaAsegurada"
+          FROM policy_risks
+         WHERE data->>'InfoAutoCode' IS NOT NULL
+           AND (${q} = '' OR concat_ws(' ', data->>'BrandName', data->>'ModelName', data->>'VersionName', patente)
+                            ILIKE ${'%' + q + '%'})
+         ORDER BY data->>'InfoAutoCode', (data->>'Year')::int DESC
+         LIMIT 40`),
+    );
+    res.json({ vehiculos: rows.rows });
+  }),
+);
+
+// Valida un código Infoauto contra San Cristóbal y devuelve cómo lo nombra.
+// Sirve para que el PAS confirme que tipeó el código correcto antes de cotizar:
+// un código equivocado no falla, cotiza OTRO auto.
+quotesRouter.get(
+  '/vehiculos/infoauto/:codigo',
+  wrap(async (req, res) => {
+    const codigo = String(req.params.codigo ?? '').trim();
+    const anio = Number(req.query.anio);
+    if (!/^\d+$/.test(codigo) || !Number.isFinite(anio)) {
+      res.status(400).json({ error: 'Pasá un código Infoauto y un año.' });
+      return;
+    }
+    if (!isScConfigured()) {
+      res.status(503).json({ error: 'La consulta al catálogo no está configurada.' });
+      return;
+    }
+    try {
+      const { scGet } = await import('../lib/sc/client.js');
+      const r = await scGet<{ Versiones?: Array<Record<string, unknown>> }>(
+        `/api/Versiones/GetVersionByCodInfoAuto?codInfoAuto=${encodeURIComponent(codigo)}&anio=${anio}`,
+      );
+      const versiones = r.Versiones ?? [];
+      const v = versiones.find(x => x.NombreCompleto && String(x.NombreCompleto).trim());
+      if (!v) {
+        // Ojo con el diagnóstico: que no venga descripción NO significa que el
+        // código sea inválido. En UAT el catálogo devuelve 200 con registros en
+        // blanco incluso para códigos que el motor de tarifas cotiza sin
+        // problema — son dos backends distintos y el del catálogo está vacío.
+        // Decir "código inválido" mandaría al PAS a buscar un error que no tiene.
+        res.status(502).json({
+          error:
+            versiones.length > 0
+              ? 'El catálogo de vehículos de la aseguradora no tiene datos en este ambiente. El código puede ser válido igual: probá cotizar.'
+              : 'La aseguradora no reconoce ese código para ese año.',
+          catalogoVacio: versiones.length > 0,
+        });
+        return;
+      }
+      res.json({
+        infoautoCode: codigo,
+        anio,
+        descripcion: String(v.NombreCompleto).trim(),
+        marca: v.MarcaDescripcion ?? null,
+        modelo: v.ModeloDescripcion ?? null,
+        version: v.VersionDescripcion ?? null,
+        precio: v.Precio ?? null,
+      });
+    } catch (err) {
+      res.status(502).json({ error: `No se pudo consultar el catálogo: ${(err as Error).message}` });
+    }
+  }),
+);
+
 // Rating en vivo contra San Cristóbal. Reemplaza las opciones que trajo la API
 // antes (source='sync') y deja intactas las cargadas a mano: el PAS puede haber
 // transcrito una cotización de otra compañía y recotizar no debe borrársela.

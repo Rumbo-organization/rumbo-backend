@@ -10,9 +10,11 @@
 //   DOTENV_CONFIG_PATH=../.env ./node_modules/.bin/tsx -r dotenv/config \
 //     scripts/sc-sync.ts [--mode backfill|incremental] [--org <uuid>]
 //                        [--codes 04-006223,04-006164] [--limit 10]
-//                        [--budget-min 30] [--dry-run]
+//                        [--budget-min 30] [--drain] [--dry-run]
 //
 // `--dry-run` lee de SC y cuenta lo que haría, sin escribir una sola fila.
+// `--drain` saltea los feeds y solo drena la cola — para retomar un backfill a
+// medias sin volver a pedir la cartera entera (13 llamadas de más por corrida).
 
 import { runScSync, type SyncMode } from '../src/sc-sync-job.js';
 
@@ -31,8 +33,11 @@ const codes = arg('codes')
   .map(c => c.trim())
   .filter(Boolean);
 const dryRun = process.argv.includes('--dry-run');
+const skipFeeds = process.argv.includes('--drain');
 
-console.log(`Sync SC · modo=${mode} · presupuesto=${budgetMin}min${dryRun ? ' · DRY RUN' : ''}`);
+console.log(
+  `Sync SC · modo=${mode}${skipFeeds ? ' (solo cola)' : ''} · presupuesto=${budgetMin}min${dryRun ? ' · DRY RUN' : ''}`,
+);
 if (codes) console.log(`Códigos: ${codes.join(', ')}`);
 
 const started = Date.now();
@@ -43,6 +48,7 @@ const result = await runScSync({
   onlyCodes: codes,
   limit,
   dryRun,
+  skipFeeds,
 });
 
 console.log(`\nCorrida ${result.runId ?? '(dry-run)'} — ${Math.round((Date.now() - started) / 1000)}s`);

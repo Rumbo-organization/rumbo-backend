@@ -124,6 +124,12 @@ export interface SyncOptions {
   dryRun?: boolean;
   /** Tope de ítems de cola a drenar (debug). */
   limit?: number;
+  /**
+   * Saltea los feeds y solo drena la cola. Para retomar un backfill a medias:
+   * volver a pedir la cartera entera no aporta nada —lo que falta ya está
+   * encolado— y son 13 llamadas de más por corrida.
+   */
+  skipFeeds?: boolean;
 }
 
 export interface SyncResult {
@@ -996,7 +1002,8 @@ export async function runScSync(options: SyncOptions): Promise<SyncResult> {
     bump(ctx, 'producer_codes', refs.length);
     await ensureState(ctx, refs);
 
-    if (options.mode === 'backfill') await feedPortfolio(ctx, refs);
+    if (options.skipFeeds) bump(ctx, 'feeds_salteados');
+    else if (options.mode === 'backfill') await feedPortfolio(ctx, refs);
     else await feedIncremental(ctx, refs);
 
     await drainQueue(ctx, options.limit);

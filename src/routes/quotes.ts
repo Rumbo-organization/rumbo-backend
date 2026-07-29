@@ -485,6 +485,22 @@ quotesRouter.post(
       postalCode: num(b.postalCode) ?? undefined,
       state: typeof b.state === 'string' ? b.state : undefined,
     };
+    // El código de productor no lo tipea el PAS: lo sabe la base. Se toma el del
+    // productor dueño de la org (`is_self`) para esa aseguradora, que es el que
+    // define qué tarifario aplica. Si viene en el body, gana el del body.
+    if (input.producerCode == null) {
+      const [pc] = await withAuthedTx(req.authCtx!, tx =>
+        tx.execute<{ code: string }>(sql`
+          SELECT pc.code
+            FROM producer_codes pc
+            JOIN producers p ON p.id = pc.producer_id
+           WHERE pc.insurer_id = ${insurerId}
+           ORDER BY p.is_self DESC, pc.created_at ASC
+           LIMIT 1`),
+      ).then(r => r.rows);
+      if (pc?.code) input.producerCode = pc.code;
+    }
+
     const faltan = ['producerCode', 'age', 'infoautoCode', 'year', 'statedAmount', 'postalCode', 'state'].filter(
       k => input[k] == null,
     );

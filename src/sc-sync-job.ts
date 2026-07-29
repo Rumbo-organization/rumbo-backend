@@ -87,8 +87,15 @@ export const SC_INSURER_NAME = 'San Cristóbal';
 
 /** SC solo deja mirar 30 días atrás; arrancamos justo adentro de la ventana. */
 const FEED_WINDOW_DAYS = 30;
-/** Máximo de días de feed que se recuperan en una sola corrida. */
-const MAX_FEED_DAYS_PER_RUN = 30;
+/**
+ * Máximo de días de feed que se recuperan en una sola corrida, POR feed y por
+ * código. Es el tope de ráfaga: 13 códigos × 3 feeds × N días. Con N=30 (la
+ * ventana entera) son ~1.170 llamadas seguidas, que es justo el patrón que a SC
+ * no le gusta. Bajarlo reparte la recuperación en varias corridas; ojo que si
+ * el atraso supera los 30 días, lo que queda afuera de la ventana se pierde
+ * igual — SC no lo devuelve.
+ */
+const MAX_FEED_DAYS_PER_RUN = Math.max(1, Number(process.env.SC_MAX_FEED_DAYS ?? 7));
 /** Un ítem que falló tantas veces deja de reintentarse (queda con last_error). */
 const MAX_ATTEMPTS = 5;
 /**
@@ -933,9 +940,23 @@ async function drainQueue(ctx: Ctx, limit?: number): Promise<void> {
 
 // ── Estado por código ────────────────────────────────────────────────────────
 
-/** Crea la fila de cursor de cada código asociado al usuario B2B. */
+/**
+ * Crea la fila de cursor de cada código asociado al usuario B2B.
+ *
+ * **Los cursores se siembran; NO arrancan en null.** Un cursor vacío hace que
+ * `pendingFeedDays` devuelva la ventana entera de 30 días, y eso por 3 feeds y
+ * por cada código es una ráfaga: con los 13 códigos de Pablo son ~1.170
+ * llamadas en la primera corrida. No hace falta ninguna: el backfill de cartera
+ * ya trae la foto actual, así que de los feeds solo se necesitan los deltas de
+ * ahí en adelante.
+ *
+ * Se siembra en anteayer, no en ayer, por el borde: si el backfill corrió antes
+ * de que se registraran los movimientos del día anterior, ese día igual se lee.
+ * Cuesta 1 día × 3 feeds por código y cierra el hueco.
+ */
 async function ensureState(ctx: Ctx, refs: ScProducerRef[]): Promise<void> {
   if (ctx.dryRun || refs.length === 0) return;
+  const desde = addDays(todayAr(), -2);
   await db
     .insert(insurerSyncState)
     .values(
@@ -944,10 +965,15 @@ async function ensureState(ctx: Ctx, refs: ScProducerRef[]): Promise<void> {
         insurerId: ctx.insurerId,
         producerCode: r.Code,
         taxId: r.TaxId,
+        lastMovementDate: desde,
+        lastPaymentDate: desde,
+        lastClaimsNewsDate: desde,
       })),
     )
     .onConflictDoUpdate({
       target: [insurerSyncState.orgId, insurerSyncState.insurerId, insurerSyncState.producerCode],
+      // Solo el taxId: los cursores de una fila que YA existe son el progreso
+      // real de la sync y pisarlos perdería o repetiría días.
       set: { taxId: sql`excluded.tax_id`, updatedAt: sql`now()` },
     });
 }

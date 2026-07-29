@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { and, asc, desc, eq, inArray, sql } from 'drizzle-orm';
 
 import { requireAuthedOrg, requireOwner } from '../middleware/authed.js';
+import { qualityScoreOf } from '../lib/contact-quality.js';
 import { db, withAuthedTx, schema, type AuthedTx } from '../db/client.js';
 import { calendar } from './calendar.js';
 import { intakeLinksRouter, intakesRouter } from './intakes.js';
@@ -1939,25 +1940,8 @@ v1.get('/contacts/:id', async (req, res, next) => {
 // Alta de contacto (regla de negocio del founder): nace SIEMPRE como prospecto
 // — no hay selector de estado. Pasa a cliente cuando se importa su primera
 // póliza. RLS + audit; producerId estampado server-side (producer_scope).
-// Calidad de datos (paridad computeDataQualityScore del monolito):
-// documento 30 + medio de contacto 30 + dirección (calle+localidad+provincia)
-// 25 + observaciones 15. Se recalcula en cada alta/edición.
-function qualityScoreOf(c: {
-  dni: string | null;
-  cuit: string | null;
-  addressStreet: string | null;
-  addressCity: string | null;
-  addressProvince: string | null;
-  contactMethods: unknown;
-  notes: string | null;
-}): number {
-  let s = 0;
-  if (c.dni || c.cuit) s += 30;
-  if (Array.isArray(c.contactMethods) && c.contactMethods.length > 0) s += 30;
-  if (c.addressStreet && c.addressCity && c.addressProvince) s += 25;
-  if (c.notes && c.notes.trim()) s += 15;
-  return s;
-}
+// Calidad de datos: la fórmula vive en lib/contact-quality.ts, compartida con
+// la sync de aseguradoras. Se recalcula en cada alta/edición.
 
 v1.post('/contacts', async (req, res, next) => {
   const b = (req.body ?? {}) as Record<string, unknown>;

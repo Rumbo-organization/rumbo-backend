@@ -41,7 +41,6 @@ import { db, schema } from './db/client.js';
 import {
   isBlocked,
   isBreakerOpen,
-  isNotEnabled,
   isTransient,
   resetBreaker,
   scClaimDetail,
@@ -66,6 +65,7 @@ import {
   type MappedContact,
 } from './lib/sc/map.js';
 import { fetchDetailByRamo, knownRoute, ramoCode, refineRamo, type RumboRamo } from './lib/sc/ramos.js';
+import { qualityScoreOf } from './lib/contact-quality.js';
 
 const {
   claims,
@@ -87,8 +87,15 @@ export const SC_INSURER_NAME = 'San Cristóbal';
 
 /** SC solo deja mirar 30 días atrás; arrancamos justo adentro de la ventana. */
 const FEED_WINDOW_DAYS = 30;
-/** Máximo de días de feed que se recuperan en una sola corrida. */
-const MAX_FEED_DAYS_PER_RUN = 30;
+/**
+ * Máximo de días de feed que se recuperan en una sola corrida, POR feed y por
+ * código. Es el tope de ráfaga: 13 códigos × 3 feeds × N días. Con N=30 (la
+ * ventana entera) son ~1.170 llamadas seguidas, que es justo el patrón que a SC
+ * no le gusta. Bajarlo reparte la recuperación en varias corridas; ojo que si
+ * el atraso supera los 30 días, lo que queda afuera de la ventana se pierde
+ * igual — SC no lo devuelve.
+ */
+const MAX_FEED_DAYS_PER_RUN = Math.max(1, Number(process.env.SC_MAX_FEED_DAYS ?? 7));
 /** Un ítem que falló tantas veces deja de reintentarse (queda con last_error). */
 const MAX_ATTEMPTS = 5;
 /**
@@ -370,6 +377,11 @@ async function upsertContactLocked(ctx: Ctx, mapped: MappedContact, producerId: 
         addressCity: mapped.addressCity,
         addressProvince: mapped.addressProvince,
         addressPostalCode: mapped.addressPostalCode,
+        // F-014: el score se recalcula en cada escritura, igual que en el alta
+        // desde la app. Sin esto, la sync completa mail y dirección pero el
+        // indicador que los mide queda en 0 — el dato mejora y el tablero de
+        // calidad dice lo contrario.
+        dataQualityScore: qualityScoreOf({ ...mapped, notes: null }),
       })
       .returning({ id: contacts.id });
     bump(ctx, 'contacts_created');
@@ -384,18 +396,25 @@ async function upsertContactLocked(ctx: Ctx, mapped: MappedContact, producerId: 
   const known = new Set(current.contactMethods.map(m => m.value));
   const mergedMethods = [...current.contactMethods, ...mapped.contactMethods.filter(m => !known.has(m.value))];
 
+  // El score se calcula sobre el resultado FINAL del merge, no sobre lo que
+  // trajo SC: el contacto puede tener datos cargados a mano que la sync no pisa
+  // y que también cuentan.
+  const merged = {
+    dni: fillIfEmpty(current.dni, mapped.dni) ?? null,
+    cuit: fillIfEmpty(current.cuit, mapped.cuit) ?? null,
+    addressStreet: fillIfEmpty(current.addressStreet, mapped.addressStreet) ?? null,
+    addressCity: fillIfEmpty(current.addressCity, mapped.addressCity) ?? null,
+    addressProvince: fillIfEmpty(current.addressProvince, mapped.addressProvince) ?? null,
+    addressPostalCode: fillIfEmpty(current.addressPostalCode, mapped.addressPostalCode) ?? null,
+    contactMethods: mergedMethods,
+  };
+
   await db
     .update(contacts)
     .set({
-      dni: fillIfEmpty(current.dni, mapped.dni),
-      cuit: fillIfEmpty(current.cuit, mapped.cuit),
+      ...merged,
       producerId: current.producerId ?? producerId,
-      contactMethods: mergedMethods,
-      addressStreet: fillIfEmpty(current.addressStreet, mapped.addressStreet),
-      addressNumber: fillIfEmpty(current.addressNumber, mapped.addressNumber),
-      addressCity: fillIfEmpty(current.addressCity, mapped.addressCity),
-      addressProvince: fillIfEmpty(current.addressProvince, mapped.addressProvince),
-      addressPostalCode: fillIfEmpty(current.addressPostalCode, mapped.addressPostalCode),
+      dataQualityScore: qualityScoreOf({ ...merged, notes: current.notes }),
       updatedAt: new Date(),
     })
     .where(eq(contacts.id, existingId));
@@ -603,6 +622,17 @@ async function syncRisks(ctx: Ctx, policyId: string, detail: Record<string, unkn
 async function syncClaim(ctx: Ctx, claimNumber: string): Promise<void> {
   const raw = await scClaimDetail(claimNumber);
   if (!raw) throw new Error(`Siniestro ${claimNumber}: SC no devolvió detalle.`);
+  await writeClaim(ctx, raw, claimNumber);
+}
+
+/**
+ * Escribe un siniestro a partir de un payload de SC ya traído. Separado del
+ * fetch por lo mismo que `writePolicy`: permite ejercitar el camino de
+ * escritura sin la API de por medio. Acá pesa más que en pólizas — UAT no tuvo
+ * NINGUNA novedad de siniestros en toda la integración, así que sin esto el
+ * mapeo de G4–G7 no se probaría nunca. Ver `scripts/sc-verify-claims.ts`.
+ */
+async function writeClaim(ctx: Ctx, raw: Record<string, unknown>, claimNumber: string): Promise<void> {
   const mapped = mapClaim(raw);
   if (!mapped) throw new Error(`Siniestro ${claimNumber}: sin nº o sin fecha de hecho.`);
 
@@ -749,18 +779,31 @@ async function feedIncremental(ctx: Ctx, refs: ScProducerRef[]): Promise<void> {
       ['lastPaymentDate', 'payments'],
       ['lastClaimsNewsDate', 'claim_news'],
     ] as Array<[CursorField, string]>) {
+      // El cursor avanza DÍA A DÍA, no de a bloques: cada día leído se
+      // persiste antes de pasar al siguiente. Eso es lo que hace que el tope
+      // de `SC_MAX_FEED_DAYS` sea un escalonado y no una pérdida — la corrida
+      // que viene arranca exactamente donde ésta cortó, sea por el tope, por
+      // el presupuesto de tiempo o por un fallo. Con el tope en 7 y el cron
+      // diario, un atraso se recupera a ~6 días netos por corrida.
       for (const day of pendingFeedDays(state[field])) {
         if (outOfTime(ctx)) return;
         await heartbeat(ctx);
         try {
           await runFeedDay(ctx, ref, feed, day);
         } catch (err) {
-          // Un servicio deshabilitado no es un fallo recuperable: se anota una
-          // vez y se sigue con los demás feeds (no queremos frenar la corrida).
           const message = err instanceof Error ? err.message : String(err);
           ctx.notes.push(`${feed} ${ref.Code} ${day}: ${message}`);
           bump(ctx, `${feed}_errors`);
-          if (!isNotEnabled(err)) return;
+
+          // Un 403 de borde es de SC cerrándonos la puerta: seguir pidiendo la
+          // profundiza, así que corta la corrida entera.
+          if (isBlocked(err)) return;
+
+          // Cualquier otro fallo —servicio no habilitado, timeout, su backend
+          // caído— corta SOLO este feed y sigue con el resto. El cursor no
+          // avanzó, así que el día se reintenta en la próxima corrida. Antes
+          // esto abortaba la corrida completa: un día flojo de un feed de un
+          // código dejaba sin sincronizar a los otros doce.
           break;
         }
         if (!ctx.dryRun) {
@@ -933,9 +976,23 @@ async function drainQueue(ctx: Ctx, limit?: number): Promise<void> {
 
 // ── Estado por código ────────────────────────────────────────────────────────
 
-/** Crea la fila de cursor de cada código asociado al usuario B2B. */
+/**
+ * Crea la fila de cursor de cada código asociado al usuario B2B.
+ *
+ * **Los cursores se siembran; NO arrancan en null.** Un cursor vacío hace que
+ * `pendingFeedDays` devuelva la ventana entera de 30 días, y eso por 3 feeds y
+ * por cada código es una ráfaga: con los 13 códigos de Pablo son ~1.170
+ * llamadas en la primera corrida. No hace falta ninguna: el backfill de cartera
+ * ya trae la foto actual, así que de los feeds solo se necesitan los deltas de
+ * ahí en adelante.
+ *
+ * Se siembra en anteayer, no en ayer, por el borde: si el backfill corrió antes
+ * de que se registraran los movimientos del día anterior, ese día igual se lee.
+ * Cuesta 1 día × 3 feeds por código y cierra el hueco.
+ */
 async function ensureState(ctx: Ctx, refs: ScProducerRef[]): Promise<void> {
   if (ctx.dryRun || refs.length === 0) return;
+  const desde = addDays(todayAr(), -2);
   await db
     .insert(insurerSyncState)
     .values(
@@ -944,10 +1001,15 @@ async function ensureState(ctx: Ctx, refs: ScProducerRef[]): Promise<void> {
         insurerId: ctx.insurerId,
         producerCode: r.Code,
         taxId: r.TaxId,
+        lastMovementDate: desde,
+        lastPaymentDate: desde,
+        lastClaimsNewsDate: desde,
       })),
     )
     .onConflictDoUpdate({
       target: [insurerSyncState.orgId, insurerSyncState.insurerId, insurerSyncState.producerCode],
+      // Solo el taxId: los cursores de una fila que YA existe son el progreso
+      // real de la sync y pisarlos perdería o repetiría días.
       set: { taxId: sql`excluded.tax_id`, updatedAt: sql`now()` },
     });
 }
@@ -1055,6 +1117,32 @@ export async function runScSync(options: SyncOptions): Promise<SyncResult> {
  *
  * No abre corrida ni toca la cola: solo el camino de escritura.
  */
+/**
+ * Escribe un siniestro desde un payload dado, sin pasar por SC. Lo usa
+ * `scripts/sc-verify-claims.ts` para ejercitar G4–G7 con un payload de
+ * laboratorio: UAT nunca devolvió una novedad de siniestro, así que es el único
+ * modo de cubrir ese camino hasta que aparezca uno real.
+ */
+export async function writeClaimFromPayload(
+  orgId: string,
+  raw: Record<string, unknown>,
+): Promise<{ counters: Record<string, number>; notes: string[] }> {
+  const insurerId = await resolveInsurerId(orgId);
+  const ctx: Ctx = {
+    orgId,
+    insurerId,
+    deadline: Number.MAX_SAFE_INTEGER,
+    dryRun: false,
+    counters: {},
+    notes: [],
+    producerByCode: await loadProducerByCode(orgId, insurerId),
+    dryQueue: [],
+    runId: null,
+  };
+  await writeClaim(ctx, raw, String(raw.ClaimNumber ?? ''));
+  return { counters: ctx.counters, notes: ctx.notes };
+}
+
 export async function replayStoredPolicies(
   orgId: string,
   details: Array<Record<string, unknown>>,

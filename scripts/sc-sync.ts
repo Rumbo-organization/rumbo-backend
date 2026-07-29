@@ -9,7 +9,7 @@
 // Uso:
 //   DOTENV_CONFIG_PATH=../.env ./node_modules/.bin/tsx -r dotenv/config \
 //     scripts/sc-sync.ts [--mode backfill|incremental] [--org <uuid>]
-//                        [--codes 04-006223,04-006164] [--limit 10]
+//                        [--codes 99-999999,99-999998] [--limit 10]
 //                        [--budget-min 30] [--drain] [--dry-run]
 //
 // `--dry-run` lee de SC y cuenta lo que haría, sin escribir una sola fila.

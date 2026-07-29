@@ -1,12 +1,18 @@
 // Multicotizador (Slice 5 de paridad; portado del router quotes del monolito).
-// El rating en vivo está gated por integración: las opciones se cargan a mano
-// (addItem) y la matriz comparativa consume byId. withAuthedTx (RLS) + audit.
+// Las opciones se cargan a mano (addItem) y la matriz comparativa consume byId.
+// withAuthedTx (RLS) + audit.
+//
+// El rating EN VIVO ya no está gated para San Cristóbal: `POST /quotes/:id/rate`
+// cotiza contra su API y escribe las opciones. Las demás aseguradoras siguen
+// siendo carga manual hasta tener su integración.
 
 import { Router, type Request, type Response, type NextFunction } from 'express';
 import { asc, desc, eq, sql } from 'drizzle-orm';
 
 import { withAuthedTx, schema } from '../db/client.js';
 import { writeAuditLogTx } from '../audit.js';
+import { isScConfigured } from '../lib/sc/client.js';
+import { quoteCa7, type Ca7QuoteInput } from '../lib/sc/quote.js';
 
 const { contacts, insurers, quoteItems, quotes } = schema;
 
@@ -343,6 +349,121 @@ quotesRouter.post(
       return;
     }
     res.status(201).json(out);
+  }),
+);
+
+// Rating en vivo contra San Cristóbal. Reemplaza las opciones que trajo la API
+// antes (source='sync') y deja intactas las cargadas a mano: el PAS puede haber
+// transcrito una cotización de otra compañía y recotizar no debe borrársela.
+//
+// Solo Automotor y solo modo rápido (código de productor + edad). El modo
+// completo le CREA la cuenta al tomador en SC, y esta integración es de lectura.
+quotesRouter.post(
+  '/quotes/:id/rate',
+  wrap(async (req, res) => {
+    const quoteId = req.params.id;
+    if (!isUuid(quoteId)) {
+      res.status(400).json({ error: 'Id inválido.' });
+      return;
+    }
+    if (!isScConfigured()) {
+      res.status(503).json({ error: 'La cotización en vivo no está configurada.' });
+      return;
+    }
+    const b = (req.body ?? {}) as Record<string, unknown>;
+    const insurerId = String(b.insurerId ?? '');
+    if (!isUuid(insurerId)) {
+      res.status(400).json({ error: 'Elegí una aseguradora.' });
+      return;
+    }
+    const num = (v: unknown): number | null => {
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    };
+    const input: Record<string, unknown> = {
+      producerCode: typeof b.producerCode === 'string' ? b.producerCode : undefined,
+      age: num(b.age) ?? undefined,
+      infoautoCode: typeof b.infoautoCode === 'string' ? b.infoautoCode : undefined,
+      year: num(b.year) ?? undefined,
+      statedAmount: num(b.statedAmount) ?? undefined,
+      postalCode: num(b.postalCode) ?? undefined,
+      state: typeof b.state === 'string' ? b.state : undefined,
+    };
+    const faltan = ['producerCode', 'age', 'infoautoCode', 'year', 'statedAmount', 'postalCode', 'state'].filter(
+      k => input[k] == null,
+    );
+    if (faltan.length) {
+      res.status(400).json({ error: `Faltan datos para cotizar: ${faltan.join(', ')}.` });
+      return;
+    }
+
+    let opciones;
+    try {
+      opciones = await quoteCa7(input as unknown as Ca7QuoteInput);
+    } catch (err) {
+      // El error de la aseguradora es información útil para el PAS ("el uso no
+      // está permitido para esa categoría"), no un 500 opaco.
+      res.status(502).json({ error: `La aseguradora rechazó la cotización: ${(err as Error).message}` });
+      return;
+    }
+    if (opciones.length === 0) {
+      res.status(502).json({ error: 'La aseguradora no devolvió opciones.' });
+      return;
+    }
+
+    const ctx = req.authCtx!;
+    const out = await withAuthedTx(ctx, async tx => {
+      const [q] = await tx.select({ id: quotes.id }).from(quotes).where(eq(quotes.id, quoteId)).limit(1);
+      if (!q) return 'no-quote';
+      const [ins] = await tx.select({ id: insurers.id }).from(insurers).where(eq(insurers.id, insurerId)).limit(1);
+      if (!ins) return 'no-insurer';
+
+      await tx
+        .delete(quoteItems)
+        .where(
+          sql`${quoteItems.quoteId} = ${quoteId} and ${quoteItems.insurerId} = ${insurerId} and ${quoteItems.source} = 'sync'`,
+        );
+      const filas = await tx
+        .insert(quoteItems)
+        .values(
+          opciones.map(o => ({
+            orgId: ctx.orgId,
+            quoteId,
+            insurerId,
+            coverage: o.coverage as (typeof quoteItems.$inferInsert)['coverage'],
+            nativeCode: o.nativeDescription ? `${o.productCode} — ${o.nativeDescription}` : o.productCode,
+            prima: o.prima != null ? String(o.prima) : null,
+            premio: o.premio != null ? String(o.premio) : null,
+            // `cuota` es lo que compara la matriz: el premio dividido en cuotas.
+            cuota: o.premio != null ? String(o.premio) : null,
+            deductible: o.deductible,
+            currency: o.currency === 'USD' ? 'USD' : 'ARS',
+            source: 'sync' as const,
+            externalRef: o.quoteId,
+          })),
+        )
+        .returning({ id: quoteItems.id });
+
+      await writeAuditLogTx(tx, {
+        orgId: ctx.orgId,
+        userId: ctx.userId,
+        action: 'rate_quote',
+        entityType: 'quote',
+        entityId: quoteId,
+        payload: { insurerId, opciones: filas.length },
+      });
+      return filas;
+    });
+
+    if (out === 'no-quote') {
+      res.status(404).json({ error: 'Cotización no encontrada.' });
+      return;
+    }
+    if (out === 'no-insurer') {
+      res.status(404).json({ error: 'Aseguradora no encontrada.' });
+      return;
+    }
+    res.status(201).json({ opciones: out.length });
   }),
 );
 

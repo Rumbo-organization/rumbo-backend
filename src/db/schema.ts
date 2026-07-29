@@ -1067,6 +1067,18 @@ export const quoteItems = pgTable(
     cuota: numeric('cuota', { precision: 14, scale: 2 }),
     currency: text('currency').notNull().default('ARS'),
 
+    // Prima y premio de la opción (rating en vivo). La carga manual sigue
+    // usando solo `cuota`, que es lo que el PAS mira para comparar; estos dos
+    // los completa la cotización por API, que sí los distingue.
+    prima: numeric('prima', { precision: 14, scale: 2 }),
+    premio: numeric('premio', { precision: 14, scale: 2 }),
+
+    // Franquicia, tal como la nombra la aseguradora ("2,5 %"). Es parte de la
+    // IDENTIDAD de la opción, no un adorno: San Cristóbal devuelve cuatro filas
+    // de Todo Riesgo que solo se distinguen por acá, con precios distintos.
+    // Sin esto, cuatro opciones se ven idénticas en la matriz de comparación.
+    deductible: text('deductible'),
+
     source: recordSource('source').notNull().default('manual'),
     externalRef: text('external_ref'),
 

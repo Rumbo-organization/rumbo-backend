@@ -1576,3 +1576,47 @@ export const insurerCatalogs = pgTable(
     index('insurer_catalogs_kind_idx').on(table.provider, table.kind, table.sort),
   ],
 );
+
+// ── Catálogo de vehículos (marcas y modelos) ─────────────────────────────────
+//
+// De dónde sale: los datos abiertos de la **DNRPA** (inscripciones iniciales y
+// transferencias, datos.jus.gob.ar). Licencia abierta, se citan la fuente.
+//
+// **Por qué no es Infoauto.** El padrón de Infoauto es un producto licenciado y
+// no tenemos acceso. Los códigos de acá son los de la DNRPA y NO sirven para
+// cotizar contra una aseguradora: son identidad y búsqueda, nada más. Quien
+// quiera rating en vivo de automotor va a tener que resolver antes el padrón.
+//
+// **Por qué las transferencias.** Las inscripciones iniciales solo traen 0km:
+// un Corolla 2012 no aparece nunca. Las transferencias son autos usados
+// cambiando de manos, que es justo la mitad larga del catálogo — con ellas el
+// rango de años va de 1925 a 2027 en vez de solo el año en curso.
+//
+// Sin `org_id`: es dato de referencia público, igual para todas las orgs.
+export const vehicleCatalog = pgTable(
+  'vehicle_catalog',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    /** Fuente del dato (`dnrpa`). Deja lugar a otro padrón si algún día se licencia. */
+    provider: text('provider').notNull(),
+    marcaCodigo: text('marca_codigo'),
+    marca: text('marca').notNull(),
+    modeloCodigo: text('modelo_codigo'),
+    /** Descripción del modelo, a nivel versión ("YARIS CROSS XLI 1.5 CVT"). */
+    modelo: text('modelo').notNull(),
+    /** Tipo de rodado de la DNRPA ("RURAL 5 PUERTAS", "SEDAN 4 PUERTAS"). */
+    tipo: text('tipo'),
+    anioDesde: integer('anio_desde'),
+    anioHasta: integer('anio_hasta'),
+    /** Cuántas veces apareció en los trámites. Ordena por lo que el PAS ve seguido. */
+    frecuencia: integer('frecuencia').notNull().default(0),
+
+    fetchedAt: timestamp('fetched_at', { withTimezone: true }).notNull().defaultNow(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  table => [
+    uniqueIndex('vehicle_catalog_value_idx').on(table.provider, table.marca, table.modelo),
+    index('vehicle_catalog_marca_idx').on(table.provider, table.marca),
+  ],
+);

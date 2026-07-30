@@ -2,17 +2,24 @@
 // Las opciones se cargan a mano (addItem) y la matriz comparativa consume byId.
 // withAuthedTx (RLS) + audit.
 //
-// El rating EN VIVO ya no está gated para San Cristóbal: `POST /quotes/:id/rate`
-// cotiza contra su API y escribe las opciones. Las demás aseguradoras siguen
-// siendo carga manual hasta tener su integración.
+// ── Sobre el rating en vivo de automotor ─────────────────────────────────────
+//
+// Hubo uno contra San Cristóbal y **se dio de baja**: su API exige el código de
+// Infoauto y ningún otro (probado — `QuoteCA7` sin `InfoautoCode` devuelve 400
+// "no puede ser nulo"), y el padrón de Infoauto es un producto licenciado al que
+// no tenemos acceso. Cotizar apoyado solo en los autos que ya estaban en la
+// cartera cubría media consulta y ninguna del auto que el productor todavía no
+// asegura, que es la mitad del trabajo.
+//
+// El vehículo ahora se elige del catálogo público de la DNRPA (`vehicle_catalog`)
+// y **todas** las opciones se cargan a mano. Si algún día hay padrón, el rating
+// vuelve: la normalización de coberturas y la forma de `quote_items` quedan.
 
 import { Router, type Request, type Response, type NextFunction } from 'express';
 import { asc, desc, eq, sql } from 'drizzle-orm';
 
 import { withAuthedTx, schema } from '../db/client.js';
 import { writeAuditLogTx } from '../audit.js';
-import { isScConfigured } from '../lib/sc/client.js';
-import { quoteCa7, type Ca7QuoteInput } from '../lib/sc/quote.js';
 
 const { contacts, insurers, quoteItems, quotes } = schema;
 
@@ -251,9 +258,9 @@ quotesRouter.post(
           vehicleAnio: optionalText(b.vehicleAnio, 8),
           vehicleVersion: optionalText(b.vehicleVersion, 120),
           notes: optionalText(b.notes, 500),
-          // Datos de rating del vehículo elegido (código Infoauto, uso, suma…).
-          // Se guardan al crear para que cotizar después no obligue a volver a
-          // elegir el auto: es el mismo dato, pedido una sola vez.
+          // Datos del vehículo elegido del catálogo (códigos DNRPA, tipo, años).
+          // Se guardan al crear para no perder de qué auto se habla — no sirven
+          // para cotizar por API, pero sí para identificarlo sin ambigüedad.
           details: b.details && typeof b.details === 'object' ? (b.details as Record<string, unknown>) : null,
           source: 'manual' as const,
         })
@@ -370,19 +377,18 @@ quotesRouter.post(
 
 // ── Catálogo de vehículos ────────────────────────────────────────────────────
 //
-// Para cotizar, San Cristóbal exige el **código Infoauto**: es excluyente y no
-// hay alternativa. Pero el PAS piensa en "Toyota Corolla XEI", no en 360835, y
-// SC solo ofrece búsqueda POR código — no por marca o modelo.
+// Sale de `vehicle_catalog`: los datos abiertos de la DNRPA (inscripciones
+// iniciales + transferencias). ~580 marcas y ~15.400 marca+modelo, con años de
+// 1925 en adelante — cubre el auto que el productor todavía no asegura, que es
+// lo que la versión anterior no podía hacer.
 //
-// El puente sale de la propia cartera sincronizada: cada auto trae su código
-// junto a marca, modelo, versión, año y suma asegurada. Cubre el caso más común
-// de un PAS con cartera —recotizar o renovar algo que ya asegura— y el catálogo
-// crece solo con cada sync.
+// Antes esto se armaba con la cartera ya sincronizada, para tener el código de
+// Infoauto que exigía la API de la aseguradora. Ese camino se dio de baja: sin
+// padrón de Infoauto no hay rating en vivo, y atar el catálogo a la cartera
+// dejaba afuera justo al prospecto nuevo.
 //
-// ⚠️ **No cubre un vehículo que nunca aseguró.** Para eso hace falta el padrón
-// de Infoauto (licencia aparte) o que SC exponga un catálogo navegable. Por eso
-// existe también la validación por código de abajo: si el PAS lo consigue por
-// otro lado, puede tipearlo y confirmar que es el correcto antes de cotizar.
+// ⚠️ Los códigos que devuelve son **de la DNRPA** y no sirven para cotizar
+// contra ninguna compañía. Identifican el vehículo; el precio se carga a mano.
 quotesRouter.get(
   '/vehiculos',
   wrap(async (req, res) => {
@@ -391,27 +397,26 @@ quotesRouter.get(
     const modelo = String((req.query.modelo ?? '') as string).trim();
     const ctx = req.authCtx!;
 
-    // Una sola llamada devuelve los tres niveles de la cascada: las marcas
-    // disponibles, los modelos de la marca elegida y las versiones concretas.
-    // Marca y modelo son datos estructurados, no texto libre — así se cotiza en
-    // el portal de cualquier compañía, y evita que un typo deje sin resultados.
-    // `q` queda como atajo para buscar por patente, que es como el PAS suele
-    // identificar un auto que ya asegura.
+    // Una sola llamada devuelve los tres niveles de la cascada: marcas, modelos
+    // de la marca elegida y las versiones concretas. Datos estructurados y no
+    // texto libre — un typo dejaría al PAS sin resultados.
     const out = await withAuthedTx(ctx, async tx => {
+      // Ordenadas por frecuencia real de patentamiento: las 10 marcas que el
+      // productor ve todos los días quedan arriba, y la cola larga (580 marcas,
+      // con acoplados y maquinaria) no le estorba.
       const marcas = await tx.execute<{ marca: string; n: number }>(sql`
-        SELECT data->>'BrandName' AS marca, count(*)::int AS n
-          FROM policy_risks
-         WHERE data->>'InfoAutoCode' IS NOT NULL AND data->>'BrandName' IS NOT NULL
-         GROUP BY 1 ORDER BY 1`);
+        SELECT marca, sum(frecuencia)::int AS n
+          FROM vehicle_catalog
+         WHERE provider = 'dnrpa'
+         GROUP BY 1 ORDER BY n DESC, marca ASC`);
 
       const modelos = marca
         ? await tx.execute<{ modelo: string; n: number }>(sql`
-            SELECT data->>'ModelName' AS modelo, count(*)::int AS n
-              FROM policy_risks
-             WHERE data->>'InfoAutoCode' IS NOT NULL
-               AND data->>'BrandName' = ${marca}
-               AND data->>'ModelName' IS NOT NULL
-             GROUP BY 1 ORDER BY 1`)
+            SELECT modelo, sum(frecuencia)::int AS n
+              FROM vehicle_catalog
+             WHERE provider = 'dnrpa' AND marca = ${marca}
+             GROUP BY 1 ORDER BY n DESC, modelo ASC
+             LIMIT 400`)
         : { rows: [] };
 
       // Las versiones solo se listan cuando ya hay por dónde acotar: sin filtro
@@ -419,24 +424,19 @@ quotesRouter.get(
       const hayFiltro = Boolean(marca || q);
       const vehiculos = hayFiltro
         ? await tx.execute(sql`
-            SELECT DISTINCT ON (data->>'InfoAutoCode')
-                   data->>'InfoAutoCode'  AS "infoautoCode",
-                   data->>'BrandName'     AS marca,
-                   data->>'ModelName'     AS modelo,
-                   data->>'VersionName'   AS version,
-                   (data->>'Year')::int   AS anio,
-                   data->>'Usage'         AS uso,
-                   data->>'Category'      AS categoria,
-                   data->>'FuelType'      AS combustible,
-                   (data->>'StatedAmount')::numeric AS "sumaAsegurada",
-                   patente
-              FROM policy_risks
-             WHERE data->>'InfoAutoCode' IS NOT NULL
-               AND (${marca} = '' OR data->>'BrandName' = ${marca})
-               AND (${modelo} = '' OR data->>'ModelName' = ${modelo})
-               AND (${q} = '' OR concat_ws(' ', data->>'BrandName', data->>'ModelName',
-                                           data->>'VersionName', patente) ILIKE ${'%' + q + '%'})
-             ORDER BY data->>'InfoAutoCode', (data->>'Year')::int DESC
+            SELECT marca_codigo   AS "marcaCodigo",
+                   marca,
+                   modelo_codigo  AS "modeloCodigo",
+                   modelo,
+                   tipo,
+                   anio_desde     AS "anioDesde",
+                   anio_hasta     AS "anioHasta"
+              FROM vehicle_catalog
+             WHERE provider = 'dnrpa'
+               AND (${marca} = '' OR marca = ${marca})
+               AND (${modelo} = '' OR modelo = ${modelo})
+               AND (${q} = '' OR (marca || ' ' || modelo) ILIKE ${'%' + q + '%'})
+             ORDER BY frecuencia DESC, marca ASC, modelo ASC
              LIMIT 60`)
         : { rows: [] };
 
@@ -504,195 +504,6 @@ quotesRouter.get(
       parentescos: catalogos.parentesco,
       actualizado: fetchedAt,
     });
-  }),
-);
-
-// Valida un código Infoauto contra San Cristóbal y devuelve cómo lo nombra.
-// Sirve para que el PAS confirme que tipeó el código correcto antes de cotizar:
-// un código equivocado no falla, cotiza OTRO auto.
-quotesRouter.get(
-  '/vehiculos/infoauto/:codigo',
-  wrap(async (req, res) => {
-    const codigo = String(req.params.codigo ?? '').trim();
-    const anio = Number(req.query.anio);
-    if (!/^\d+$/.test(codigo) || !Number.isFinite(anio)) {
-      res.status(400).json({ error: 'Pasá un código Infoauto y un año.' });
-      return;
-    }
-    if (!isScConfigured()) {
-      res.status(503).json({ error: 'La consulta al catálogo no está configurada.' });
-      return;
-    }
-    try {
-      const { scGet } = await import('../lib/sc/client.js');
-      const r = await scGet<{ Versiones?: Array<Record<string, unknown>> }>(
-        `/api/Versiones/GetVersionByCodInfoAuto?codInfoAuto=${encodeURIComponent(codigo)}&anio=${anio}`,
-      );
-      const versiones = r.Versiones ?? [];
-      const v = versiones.find(x => x.NombreCompleto && String(x.NombreCompleto).trim());
-      if (!v) {
-        // Ojo con el diagnóstico: que no venga descripción NO significa que el
-        // código sea inválido. En UAT el catálogo devuelve 200 con registros en
-        // blanco incluso para códigos que el motor de tarifas cotiza sin
-        // problema — son dos backends distintos y el del catálogo está vacío.
-        // Decir "código inválido" mandaría al PAS a buscar un error que no tiene.
-        res.status(502).json({
-          error:
-            versiones.length > 0
-              ? 'El catálogo de vehículos de la aseguradora no tiene datos en este ambiente. El código puede ser válido igual: probá cotizar.'
-              : 'La aseguradora no reconoce ese código para ese año.',
-          catalogoVacio: versiones.length > 0,
-        });
-        return;
-      }
-      res.json({
-        infoautoCode: codigo,
-        anio,
-        descripcion: String(v.NombreCompleto).trim(),
-        marca: v.MarcaDescripcion ?? null,
-        modelo: v.ModeloDescripcion ?? null,
-        version: v.VersionDescripcion ?? null,
-        precio: v.Precio ?? null,
-      });
-    } catch (err) {
-      res.status(502).json({ error: `No se pudo consultar el catálogo: ${(err as Error).message}` });
-    }
-  }),
-);
-
-// Rating en vivo contra San Cristóbal. Reemplaza las opciones que trajo la API
-// antes (source='sync') y deja intactas las cargadas a mano: el PAS puede haber
-// transcrito una cotización de otra compañía y recotizar no debe borrársela.
-//
-// Solo Automotor y solo modo rápido (código de productor + edad). El modo
-// completo le CREA la cuenta al tomador en SC, y esta integración es de lectura.
-quotesRouter.post(
-  '/quotes/:id/rate',
-  wrap(async (req, res) => {
-    const quoteId = req.params.id;
-    if (!isUuid(quoteId)) {
-      res.status(400).json({ error: 'Id inválido.' });
-      return;
-    }
-    if (!isScConfigured()) {
-      res.status(503).json({ error: 'La cotización en vivo no está configurada.' });
-      return;
-    }
-    const b = (req.body ?? {}) as Record<string, unknown>;
-    const insurerId = String(b.insurerId ?? '');
-    if (!isUuid(insurerId)) {
-      res.status(400).json({ error: 'Elegí una aseguradora.' });
-      return;
-    }
-    const num = (v: unknown): number | null => {
-      const n = Number(v);
-      return Number.isFinite(n) ? n : null;
-    };
-    const input: Record<string, unknown> = {
-      producerCode: typeof b.producerCode === 'string' ? b.producerCode : undefined,
-      age: num(b.age) ?? undefined,
-      infoautoCode: typeof b.infoautoCode === 'string' ? b.infoautoCode : undefined,
-      year: num(b.year) ?? undefined,
-      statedAmount: num(b.statedAmount) ?? undefined,
-      postalCode: num(b.postalCode) ?? undefined,
-      state: typeof b.state === 'string' ? b.state : undefined,
-      // El uso cambia la tarifa (personal vs comercial vs taxi). Viene
-      // prellenado del vehículo, pero el PAS puede cotizar otro escenario.
-      usage: typeof b.usage === 'string' && b.usage ? b.usage : undefined,
-      category: typeof b.category === 'string' && b.category ? b.category : undefined,
-      fuelType: typeof b.fuelType === 'string' && b.fuelType ? b.fuelType : undefined,
-    };
-    // El código de productor no lo tipea el PAS: lo sabe la base. Se toma el del
-    // productor dueño de la org (`is_self`) para esa aseguradora, que es el que
-    // define qué tarifario aplica. Si viene en el body, gana el del body.
-    if (input.producerCode == null) {
-      const [pc] = await withAuthedTx(req.authCtx!, tx =>
-        tx.execute<{ code: string }>(sql`
-          SELECT pc.code
-            FROM producer_codes pc
-            JOIN producers p ON p.id = pc.producer_id
-           WHERE pc.insurer_id = ${insurerId}
-           ORDER BY p.is_self DESC, pc.created_at ASC
-           LIMIT 1`),
-      ).then(r => r.rows);
-      if (pc?.code) input.producerCode = pc.code;
-    }
-
-    const faltan = ['producerCode', 'age', 'infoautoCode', 'year', 'statedAmount', 'postalCode', 'state'].filter(
-      k => input[k] == null,
-    );
-    if (faltan.length) {
-      res.status(400).json({ error: `Faltan datos para cotizar: ${faltan.join(', ')}.` });
-      return;
-    }
-
-    let opciones;
-    try {
-      opciones = await quoteCa7(input as unknown as Ca7QuoteInput);
-    } catch (err) {
-      // El error de la aseguradora es información útil para el PAS ("el uso no
-      // está permitido para esa categoría"), no un 500 opaco.
-      res.status(502).json({ error: `La aseguradora rechazó la cotización: ${(err as Error).message}` });
-      return;
-    }
-    if (opciones.length === 0) {
-      res.status(502).json({ error: 'La aseguradora no devolvió opciones.' });
-      return;
-    }
-
-    const ctx = req.authCtx!;
-    const out = await withAuthedTx(ctx, async tx => {
-      const [q] = await tx.select({ id: quotes.id }).from(quotes).where(eq(quotes.id, quoteId)).limit(1);
-      if (!q) return 'no-quote';
-      const [ins] = await tx.select({ id: insurers.id }).from(insurers).where(eq(insurers.id, insurerId)).limit(1);
-      if (!ins) return 'no-insurer';
-
-      await tx
-        .delete(quoteItems)
-        .where(
-          sql`${quoteItems.quoteId} = ${quoteId} and ${quoteItems.insurerId} = ${insurerId} and ${quoteItems.source} = 'sync'`,
-        );
-      const filas = await tx
-        .insert(quoteItems)
-        .values(
-          opciones.map(o => ({
-            orgId: ctx.orgId,
-            quoteId,
-            insurerId,
-            coverage: o.coverage as (typeof quoteItems.$inferInsert)['coverage'],
-            nativeCode: o.nativeDescription ? `${o.productCode} — ${o.nativeDescription}` : o.productCode,
-            prima: o.prima != null ? String(o.prima) : null,
-            premio: o.premio != null ? String(o.premio) : null,
-            // `cuota` es lo que compara la matriz: el premio dividido en cuotas.
-            cuota: o.premio != null ? String(o.premio) : null,
-            deductible: o.deductible,
-            currency: o.currency === 'USD' ? 'USD' : 'ARS',
-            source: 'sync' as const,
-            externalRef: o.quoteId,
-          })),
-        )
-        .returning({ id: quoteItems.id });
-
-      await writeAuditLogTx(tx, {
-        orgId: ctx.orgId,
-        userId: ctx.userId,
-        action: 'rate_quote',
-        entityType: 'quote',
-        entityId: quoteId,
-        payload: { insurerId, opciones: filas.length },
-      });
-      return filas;
-    });
-
-    if (out === 'no-quote') {
-      res.status(404).json({ error: 'Cotización no encontrada.' });
-      return;
-    }
-    if (out === 'no-insurer') {
-      res.status(404).json({ error: 'Aseguradora no encontrada.' });
-      return;
-    }
-    res.status(201).json({ opciones: out.length });
   }),
 );
 

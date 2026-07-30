@@ -1533,3 +1533,46 @@ export const insurerSyncRuns = pgTable(
       .where(sql`status = 'running'`),
   ],
 );
+
+// ── Catálogos de la aseguradora (insumo del cotizador) ───────────────────────
+//
+// Provincias, usos, categorías, combustibles, coberturas: los códigos con los
+// que hay que hablarle a la compañía (la provincia viaja como `AR_13`, no como
+// "Córdoba"). Hasta ahora el formulario se los pedía a San Cristóbal **en vivo,
+// en cada apertura**. Eso ataba abrir un formulario a que la API de un tercero
+// estuviera arriba, y la de SC tarda decenas de segundos, tiene cuota y ya nos
+// bloqueó el acceso una vez (doc 18 §6.1.1).
+//
+// Acá se materializan. El formulario lee de nuestra base; a la aseguradora se le
+// pega solo al cotizar, que es lo único incacheable porque es tarifa.
+//
+// **Sin `org_id`, a propósito.** Es dato de referencia de la integración, igual
+// para todas las orgs — no dato del inquilino. Por eso se indexa por `provider`
+// (la integración) y no por `insurer_id`, que en este modelo es por-org: cada
+// organización tiene su propia fila "San Cristóbal" y duplicar 600 valores de
+// catálogo por cada una sería basura. La RLS lo refleja: lectura para todos,
+// escritura solo del job (que corre como owner, sin rol `authenticated`).
+export const insurerCatalogs = pgTable(
+  'insurer_catalogs',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    /** Integración de origen (`sc`). No es el `insurers.id`, que es por-org. */
+    provider: text('provider').notNull(),
+    /** Catálogo al que pertenece el valor (`usage`, `category`, `state`…). */
+    kind: text('kind').notNull(),
+    /** Código de la aseguradora: es lo que viaja en el request de cotización. */
+    code: text('code').notNull(),
+    label: text('label').notNull(),
+    /** Orden en que lo devolvió la compañía; se respeta al mostrarlo. */
+    sort: integer('sort').notNull().default(0),
+    /** Cuándo se trajo. Un catálogo viejo sigue sirviendo, pero hay que verlo. */
+    fetchedAt: timestamp('fetched_at', { withTimezone: true }).notNull().defaultNow(),
+
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  table => [
+    uniqueIndex('insurer_catalogs_value_idx').on(table.provider, table.kind, table.code),
+    index('insurer_catalogs_kind_idx').on(table.provider, table.kind, table.sort),
+  ],
+);

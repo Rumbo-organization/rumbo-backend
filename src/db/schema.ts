@@ -349,11 +349,23 @@ export const insurers = pgTable(
       .notNull()
       .references(() => organizations.id, { onDelete: 'cascade' }),
     name: text('name').notNull(),
+    // Clave canónica estable de la aseguradora (`san_cristobal`). La sync
+    // matchea por acá, NO por `name` (frágil a typos/tildes). Nullable: una
+    // aseguradora cargada a mano sin integración no la necesita.
+    key: text('key'),
+    // Código de Organizador de la org EN esta aseguradora (`04-005954`). Es
+    // por-aseguradora, no global (por eso vive acá y no en `organizations`).
+    // Lo devuelve SC en la cartera (`OrganizerCode`); lo persiste la sync.
+    organizerCode: text('organizer_code'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   table => [
     index('insurers_org_idx').on(table.orgId),
     uniqueIndex('insurers_org_name_idx').on(table.orgId, table.name),
+    // Una key canónica por org (parcial: las que no tienen key no chocan).
+    uniqueIndex('insurers_org_key_idx')
+      .on(table.orgId, table.key)
+      .where(sql`${table.key} IS NOT NULL`),
     // Búsqueda trigram por nombre de aseguradora (ver 0002_search_trgm_indexes.sql).
     index('insurers_name_trgm').using('gin', sql`${table.name} gin_trgm_ops`),
   ],
@@ -526,7 +538,6 @@ export const policies = pgTable(
     source: recordSource('source').notNull().default('manual'),
     externalRef: text('external_ref'), // nº de póliza en la aseguradora
     externalRaw: jsonb('external_raw'), // payload crudo persistido (O-64)
-    syncBatchId: text('sync_batch_id'), // ID Lote (§2.16)
     lastReadAt: timestamp('last_read_at', { withTimezone: true }), // fecha lectura
     lastChangedAt: timestamp('last_changed_at', { withTimezone: true }), // fecha actualización
 

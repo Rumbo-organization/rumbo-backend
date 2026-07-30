@@ -35,7 +35,7 @@
 // movimientos. El histórico completo sigue viniendo del export XLSX
 // (docs/rumbo/15-import-cartera.md) — los dos caminos son complementarios.
 
-import { and, asc, eq, inArray, isNull, notInArray, sql } from 'drizzle-orm';
+import { and, asc, eq, inArray, isNull, notInArray, or, sql } from 'drizzle-orm';
 
 import { db, schema } from './db/client.js';
 import {
@@ -84,6 +84,10 @@ const {
 
 /** Nombre canónico de la aseguradora en el catálogo de la org. */
 export const SC_INSURER_NAME = 'San Cristóbal';
+
+/** Clave canónica de SC en `insurers.key`. La sync resuelve por acá (estable a
+ *  typos/tildes) y cae al nombre por compatibilidad con filas viejas sin key. */
+export const SC_INSURER_KEY = 'san_cristobal';
 
 /** SC solo deja mirar 30 días atrás; arrancamos justo adentro de la ventana. */
 const FEED_WINDOW_DAYS = 30;
@@ -217,7 +221,7 @@ async function resolveInsurerId(orgId: string): Promise<string> {
   const [row] = await db
     .select({ id: insurers.id })
     .from(insurers)
-    .where(and(eq(insurers.orgId, orgId), eq(insurers.name, SC_INSURER_NAME)))
+    .where(and(eq(insurers.orgId, orgId), or(eq(insurers.key, SC_INSURER_KEY), eq(insurers.name, SC_INSURER_NAME))))
     .limit(1);
   if (!row) {
     throw new Error(
@@ -499,6 +503,7 @@ async function writePolicy(
     endDate: mapped.endDate,
     prima: mapped.prima,
     premio: mapped.premio,
+    sumaAsegurada: mapped.sumaAsegurada,
     currency: mapped.currency,
     canceledAt: mapped.canceledAt,
     cancelReason: mapped.cancelReason,
@@ -718,6 +723,17 @@ async function feedPortfolio(ctx: Ctx, refs: ScProducerRef[]): Promise<void> {
     await heartbeat(ctx);
     const rows = await scPortfolio(ref.Code);
     bump(ctx, 'portfolio_rows', rows.length);
+
+    // El código de Organizador (`04-005954`) viene en cada fila de cartera y es
+    // el mismo para toda la org: lo persistimos en `insurers` (doc 18 §3.2). Se
+    // escribe solo si cambió, para no pegarle a la DB en cada corrida.
+    const organizerCode = rows.find(r => r.OrganizerCode)?.OrganizerCode ?? null;
+    if (organizerCode && !ctx.dryRun) {
+      await db
+        .update(insurers)
+        .set({ organizerCode })
+        .where(and(eq(insurers.id, ctx.insurerId), sql`${insurers.organizerCode} is distinct from ${organizerCode}`));
+    }
 
     // El alta liviana del contacto adelanta identidad (nombre + documento) para
     // que la cartera se vea completa aunque el detalle todavía esté en la cola.

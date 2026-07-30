@@ -20,7 +20,7 @@ import { and, eq } from 'drizzle-orm';
 
 import { db, schema } from '../src/db/client.js';
 import { scGet, scProducers } from '../src/lib/sc/client.js';
-import { SC_INSURER_NAME } from '../src/sc-sync-job.js';
+import { SC_INSURER_KEY, SC_INSURER_NAME } from '../src/sc-sync-job.js';
 
 const { insurers, producerCodes, producers } = schema;
 
@@ -73,7 +73,10 @@ if (existingInsurer) {
   insurerId = '(dry-run)';
   console.log(`Crearía la aseguradora "${SC_INSURER_NAME}".`);
 } else {
-  const [row] = await db.insert(insurers).values({ orgId, name: SC_INSURER_NAME }).returning({ id: insurers.id });
+  const [row] = await db
+    .insert(insurers)
+    .values({ orgId, name: SC_INSURER_NAME, key: SC_INSURER_KEY })
+    .returning({ id: insurers.id });
   insurerId = row!.id;
   console.log(`Aseguradora creada: ${insurerId}`);
 }

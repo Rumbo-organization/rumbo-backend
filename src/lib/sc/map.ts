@@ -176,6 +176,7 @@ export interface MappedPolicy {
   endDate: string | null;
   prima: string | null;
   premio: string | null;
+  sumaAsegurada: string | null;
   currency: string;
   canceledAt: string | null;
   cancelReason: string | null;
@@ -248,6 +249,9 @@ export function mapPolicy(detail: Rec, ramo: RumboRamo, requestedNumber?: string
   // última transacción (`TotalPremiumRPT`/`TotalCostRPT`, ya acumulados hasta
   // ella — a diferencia de `Transaction*Rpt`, que es el delta del movimiento).
   const lastTx = arr(detail.Transactions).at(-1) ?? {};
+  // Suma asegurada: auto/moto la trae el vehículo (`StatedAmount`). En patrimonial
+  // vive repartida en las coberturas por-riesgo (fuzzy) → se difiere, queda null.
+  const suma = money(rec(detail.Vehicle)?.StatedAmount);
   return {
     policyNumber: resolvePolicyNumber(detail, requestedNumber) as string,
     ramo,
@@ -256,6 +260,7 @@ export function mapPolicy(detail: Rec, ramo: RumboRamo, requestedNumber?: string
     endDate: ymd(detail.PeriodEnd),
     prima: money(detail.TotalPremium) ?? money(lastTx.TotalPremiumRPT),
     premio: money(detail.TotalCost) ?? money(lastTx.TotalCostRPT),
+    sumaAsegurada: suma,
     currency: (
       code(arr(detail.PreferredCoverageCurrencies).find(c => c.Selected === true)?.Code) ?? 'ars'
     ).toUpperCase(),

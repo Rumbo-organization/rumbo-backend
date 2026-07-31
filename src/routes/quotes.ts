@@ -451,28 +451,59 @@ quotesRouter.get(
 // Van acá y no hardcodeados en el front por dos razones: los códigos son de la
 // aseguradora (la provincia viaja como `AR_17`, no como "Neuquén") y cambian sin
 // avisarnos. Pedirle al PAS que tipee un código interno era pedirle que adivine.
+//
+// **Salen de nuestra base, no de la aseguradora.** Antes esta ruta le pegaba a
+// San Cristóbal en vivo, dos veces, cada vez que se abría el formulario: abrir
+// una pantalla dependía de que la API de un tercero estuviera arriba. Ahora los
+// refresca un job (`scripts/sc-refresh-catalogos.ts`) y acá se leen de
+// `insurer_catalogs`. El formulario abre aunque SC esté caído; a la compañía se
+// le pega solo al cotizar, que es lo único incacheable porque es tarifa.
 quotesRouter.get(
   '/cotizador/catalogos',
-  wrap(async (_req, res) => {
-    if (!isScConfigured()) {
-      res.status(503).json({ error: 'La cotización en vivo no está configurada.' });
+  wrap(async (req, res) => {
+    const { readScCatalogs } = await import('../lib/sc/catalogs.js');
+    const { catalogos, fetchedAt } = await withAuthedTx(req.authCtx!, tx =>
+      readScCatalogs(tx, [
+        'provincia',
+        'uso',
+        'categoria',
+        'combustible',
+        'color',
+        'cobertura',
+        'proveedor_gps',
+        'tipo_documento',
+        'actividad_comercio',
+        'ocupacion_vida',
+        'tipo_beneficiario',
+        'parentesco',
+      ]),
+    );
+
+    // Caché nunca sembrada. Es un paso de operación, no un error del PAS: sin
+    // esto el formulario mostraría selectores vacíos sin explicar por qué.
+    if (!fetchedAt) {
+      res.status(503).json({
+        error: 'Los catálogos de la aseguradora todavía no se cargaron. Corré scripts/sc-refresh-catalogos.ts.',
+      });
       return;
     }
-    try {
-      const { scGet } = await import('../lib/sc/client.js');
-      const [prov, usos] = await Promise.all([
-        scGet<{ States?: Array<{ Code: string; Description: string }> }>(
-          '/api/ClaimCatalog/states-by-country?countryCode=AR',
-        ),
-        scGet<{ Values?: Array<{ Code: string; Description: string }> }>('/api/TypeList/Usage'),
-      ]);
-      res.json({
-        provincias: (prov.States ?? []).map(x => ({ code: x.Code, label: x.Description })),
-        usos: (usos.Values ?? []).map(x => ({ code: x.Code, label: x.Description })),
-      });
-    } catch (err) {
-      res.status(502).json({ error: `No se pudieron traer los catálogos: ${(err as Error).message}` });
-    }
+
+    res.json({
+      // `provincias` y `usos` conservan el nombre que ya consume el front.
+      provincias: catalogos.provincia,
+      usos: catalogos.uso,
+      categorias: catalogos.categoria,
+      combustibles: catalogos.combustible,
+      colores: catalogos.color,
+      coberturas: catalogos.cobertura,
+      proveedoresGps: catalogos.proveedor_gps,
+      tiposDocumento: catalogos.tipo_documento,
+      actividadesComercio: catalogos.actividad_comercio,
+      ocupacionesVida: catalogos.ocupacion_vida,
+      tiposBeneficiario: catalogos.tipo_beneficiario,
+      parentescos: catalogos.parentesco,
+      actualizado: fetchedAt,
+    });
   }),
 );
 

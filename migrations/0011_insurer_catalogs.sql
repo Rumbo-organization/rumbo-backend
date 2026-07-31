@@ -1,4 +1,4 @@
--- 0010_insurer_catalogs — catálogos de la aseguradora, cacheados de nuestro lado
+-- 0011_insurer_catalogs — catálogos de la aseguradora, cacheados de nuestro lado
 --
 -- **El problema que resuelve.** El formulario de cotización necesita los códigos
 -- con los que habla la compañía (la provincia viaja como `AR_13`, el uso como
@@ -21,7 +21,7 @@
 -- Se aplica a mano contra la branch de Neon (no hay runner):
 --
 --   DOTENV_CONFIG_PATH=../.env ./node_modules/.bin/tsx -r dotenv/config \
---     scripts/apply-migration.mjs migrations/0010_insurer_catalogs.sql
+--     scripts/apply-migration.mjs migrations/0011_insurer_catalogs.sql
 --
 -- Idempotente: se puede correr más de una vez.
 

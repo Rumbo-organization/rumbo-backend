@@ -12,11 +12,25 @@ son **cambios incrementales**, aplicados en orden. Son idempotentes (`ADD ... IF
     node --env-file=../.env scripts/apply-migration.mjs migrations/00NN_nombre.sql
 
 **Base vacía desde cero (branch de Neon nueva):** los numerados NO alcanzan — arrancan en
-una feature (`0001_calendar_events`), no crean las tablas base. Para eso está **`_baseline.sql`**:
-el esquema COMPLETO (36 tablas + índices + FKs + la extensión `pg_trgm`) materializado desde
-`schema.ts`. Equivale a aplicar 0001→00NN sobre una base vacía.
+una feature (`0001_calendar_events`), no crean las tablas base. Para eso están los **DOS**
+archivos `_baseline*`, que se aplican **en este orden**:
 
     node --env-file=../.env scripts/apply-migration.mjs migrations/_baseline.sql
+    node --env-file=../.env scripts/apply-migration.mjs migrations/_baseline_security.sql
+
+1. **`_baseline.sql`** — el esquema COMPLETO (36 tablas + índices + FKs + la extensión
+   `pg_trgm`) materializado desde `schema.ts`.
+2. **`_baseline_security.sql`** — el rol `authenticated`, las funciones de claims
+   (`current_org_id()`, `current_user_id()`, `is_org_admin()`, `current_producer_id()`),
+   los GRANTs, el `ENABLE ROW LEVEL SECURITY` y todas las policies.
+
+> ⚠️ **Los dos son obligatorios.** `_baseline.sql` lo genera `drizzle-kit`, que sólo emite
+> tablas/columnas/índices/FKs: **no puede representar roles, RLS, policies ni funciones SQL**.
+> Toda la capa de aislamiento multi-tenant (CLAUDE.md §6, D-018/D-021) siempre vivió como SQL
+> escrito a mano dentro de las migraciones incrementales. Una base bootstrapeada sólo con
+> `_baseline.sql` queda con las tablas pero **sin nada de seguridad**, y `withAuthedTx` revienta
+> en cada request autenticado con `role "authenticated" does not exist` (le pasó a la base de
+> producción el 31/07/2026: la app quedó caída para todo usuario logueado).
 
 ## Regenerar `_baseline.sql` cuando cambie `schema.ts`
 
@@ -30,3 +44,12 @@ El proyecto no tiene drizzle-kit como dependencia. Se corre puntualmente en un d
    guardarlo como `migrations/_baseline.sql`.
 
 Contrastar contra `schema.ts` con `scripts/schema-drift.ts` para confirmar que no quedó drift.
+
+## Mantener `_baseline_security.sql`
+
+No se autogenera: es SQL a mano. Cada vez que una migración incremental agregue una tabla
+nueva con RLS, sumar ahí su GRANT + `ENABLE ROW LEVEL SECURITY` + policies, para que una base
+creada desde cero quede igual que una que aplicó todos los incrementos. El archivo refleja el
+**estado final**, no el histórico: las definiciones de la era Clerk (`clerk_org_id`,
+`clerk_user_id`, tabla `memberships`) quedaron fuera a propósito — esas columnas y tablas
+dejaron de existir en el cutover a Better Auth (D-021).

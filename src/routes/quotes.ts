@@ -507,6 +507,120 @@ quotesRouter.get(
   }),
 );
 
+// ── Catálogo de InfoAuto ─────────────────────────────────────────────────────
+//
+// La cascada real marca → modelo → versión → año, contra el padrón de InfoAuto
+// (docs/rumbo/19-api-infoauto.md). Es lo que cierra el agujero de `/vehiculos`:
+// ahí la cascada sale de la cartera ya sincronizada y no cubre un auto que el
+// PAS nunca aseguró.
+//
+// **Un nivel por request, a demanda.** No hay endpoint de "traeme todo": InfoAuto
+// declara mal uso explícito recorrer el catálogo para copiarlo localmente (§4 del
+// doc). Cada llamada acá es una persona eligiendo un auto, no un batch.
+//
+// Se usa la cascada estructurada y no `/search/` porque los tres niveles viajan
+// en el path: no hay ningún query param adivinado. El buscador por texto libre
+// entra cuando se pueda correr una llamada real y confirmar sus parámetros.
+
+type InfoautoMod = typeof import('../lib/infoauto/client.js');
+
+// El módulo se importa una vez y se reusa: `await import` en cada request paga
+// resolución de módulo por llamada, y esta cascada son 3-4 requests seguidas.
+let infoautoMod: InfoautoMod | null = null;
+
+/** 503 si no hay credenciales: es configuración faltante, no un fallo de ellos. */
+async function requiereInfoauto(res: Response): Promise<InfoautoMod | null> {
+  const mod = (infoautoMod ??= await import('../lib/infoauto/client.js'));
+  if (!mod.isInfoautoConfigured()) {
+    res.status(503).json({ error: 'El catálogo de vehículos no está configurado.' });
+    return null;
+  }
+  return mod;
+}
+
+/** Traduce los fallos del cliente a la forma de error de la API. */
+function respondeInfoautoError(mod: InfoautoMod, res: Response, err: unknown): void {
+  if (mod.isRateLimited(err)) {
+    res
+      .status(429)
+      .json({ error: 'El catálogo de vehículos está recibiendo demasiadas consultas. Probá en unos segundos.' });
+    return;
+  }
+  res.status(502).json({ error: `No se pudo consultar el catálogo de vehículos: ${(err as Error).message}` });
+}
+
+const idValido = (s: unknown): boolean => typeof s === 'string' && /^\d{1,9}$/.test(s);
+
+quotesRouter.get(
+  '/infoauto/marcas',
+  wrap(async (_req, res) => {
+    const mod = await requiereInfoauto(res);
+    if (!mod) return;
+    try {
+      res.json({ data: await mod.listarMarcas() });
+    } catch (err) {
+      respondeInfoautoError(mod, res, err);
+    }
+  }),
+);
+
+quotesRouter.get(
+  '/infoauto/marcas/:brandId/grupos',
+  wrap(async (req, res) => {
+    if (!idValido(req.params.brandId)) {
+      res.status(400).json({ error: 'Marca inválida.' });
+      return;
+    }
+    const mod = await requiereInfoauto(res);
+    if (!mod) return;
+    try {
+      res.json({ data: await mod.listarGrupos(Number(req.params.brandId)) });
+    } catch (err) {
+      respondeInfoautoError(mod, res, err);
+    }
+  }),
+);
+
+quotesRouter.get(
+  '/infoauto/marcas/:brandId/grupos/:groupId/modelos',
+  wrap(async (req, res) => {
+    if (!idValido(req.params.brandId) || !idValido(req.params.groupId)) {
+      res.status(400).json({ error: 'Marca o modelo inválidos.' });
+      return;
+    }
+    const mod = await requiereInfoauto(res);
+    if (!mod) return;
+    try {
+      const modelos = await mod.listarModelos(Number(req.params.brandId), Number(req.params.groupId));
+      // Los dados de baja se devuelven igual, marcados: una póliza vieja puede
+      // seguir apuntando a un CODIA que salió del padrón, y ocultarlo dejaría al
+      // PAS sin poder recotizarla.
+      res.json({ data: modelos });
+    } catch (err) {
+      respondeInfoautoError(mod, res, err);
+    }
+  }),
+);
+
+// Los años cotizables del modelo, con su precio de usado. Alimenta el select de
+// año y precarga la suma asegurada.
+quotesRouter.get(
+  '/infoauto/modelos/:codia/precios',
+  wrap(async (req, res) => {
+    if (!idValido(req.params.codia)) {
+      res.status(400).json({ error: 'Código Infoauto inválido.' });
+      return;
+    }
+    const mod = await requiereInfoauto(res);
+    if (!mod) return;
+    try {
+      res.json({ data: await mod.listarPrecios(String(req.params.codia)) });
+    } catch (err) {
+      respondeInfoautoError(mod, res, err);
+    }
+  }),
+);
+
 // Valida un código Infoauto contra San Cristóbal y devuelve cómo lo nombra.
 // Sirve para que el PAS confirme que tipeó el código correcto antes de cotizar:
 // un código equivocado no falla, cotiza OTRO auto.

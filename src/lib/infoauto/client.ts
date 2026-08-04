@@ -23,10 +23,18 @@
 //     una sola vez, en el borde. Si se dispersa por la app, tarde o temprano
 //     alguien la aplica dos veces o ninguna y la suma asegurada sale 1000× mal.
 //
-// ⚠️ Relevado de la documentación del portal (4-ago-2026) — **sin ejecutar
-// llamadas contra la API**. Los paths están confirmados; los nombres de los
-// campos de respuesta salen del "Modelo de datos" del portal. La primera corrida
-// real contra la API es la que valida esto.
+// ── Verificado contra demo (4-ago-2026, `scripts/infoauto-probe.ts`) ────────
+//
+// Los nombres de campo del "Modelo de datos" resultaron correctos. Lo que la
+// documentación NO decía y solo apareció al ejecutar:
+//
+//  · **Todo viene paginado de a 10.** `/brands/` devolvía 10 de 12 marcas sin
+//    quejarse. En producción eso es un selector con las diez primeras marcas
+//    alfabéticas y nada más.
+//  · **El cupo se publica en headers** y es de **5 llamadas por minuto** para el
+//    catálogo. No hay que adivinarlo.
+//  · **Los precios dan 403 con la licencia de demo.** El catálogo responde bien;
+//    `/models/{codia}/prices/` y `/list_price` no están incluidos.
 
 import { isRedisConfigured, redisGet, redisSet } from '../../redis.js';
 
@@ -47,12 +55,20 @@ const DB = 'cars';
 const REQUEST_TIMEOUT_MS = Number(process.env.INFOAUTO_TIMEOUT_MS ?? 20_000);
 /** Reintentos ante 429/5xx. El 4xx no se reintenta: es contrato, no clima. */
 const MAX_RETRIES = 2;
+
 /**
- * Techo de llamadas por segundo. InfoAuto no publica el número del plan, y la
- * consecuencia de pasarse es bloqueo de credenciales, así que el default es
- * conservador. El uso real es una persona eligiendo un auto, no un batch.
+ * Tamaño de página. **La API pagina de a 10 por default** y lo informa en el
+ * header `x-pagination`. Sin esto, listar marcas devolvía 10 de 12 y en
+ * producción dejaría al PAS eligiendo entre las primeras diez alfabéticas.
+ *
+ * 100 verificado contra demo. Cuanto más grande, menos requests — y el cupo es
+ * lo escaso acá (ver `registrarCupo`).
  */
-const RATE_PER_SEC = Number(process.env.INFOAUTO_RATE_PER_SEC ?? 4);
+const PAGE_SIZE = 100;
+/** Tope de páginas por listado. Con `PAGE_SIZE` alto es una red de seguridad. */
+const MAX_PAGES = 20;
+/** Cuánto se acepta esperar a que se libere el cupo antes de fallar. */
+const MAX_ESPERA_CUPO_MS = 15_000;
 
 /** El access token dura 1 h; se cachea por menos para no cortar al filo. */
 const ACCESS_TTL_SEC = 55 * 60;
@@ -82,26 +98,63 @@ export function isRateLimited(err: unknown): boolean {
   return err instanceof InfoautoError && err.status === 429;
 }
 
-// ── Throttle ─────────────────────────────────────────────────────────────────
+/**
+ * 403: el plan contratado no incluye ese dato. **No es un error nuestro ni de
+ * ellos** — es alcance comercial, y la app tiene que poder seguir sin eso.
+ * Verificado: los precios dan 403 con la licencia de demo, el catálogo no.
+ */
+export function isSinLicencia(err: unknown): boolean {
+  return err instanceof InfoautoError && err.status === 403;
+}
 
-let tokens = RATE_PER_SEC;
-let lastRefill = Date.now();
+// ── Cupo ─────────────────────────────────────────────────────────────────────
+//
+// InfoAuto **sí publica el cupo**, en headers de cada respuesta:
+// `x-ratelimit-limit`, `x-ratelimit-remaining` y `x-ratelimit-reset` (epoch en
+// segundos). No hay que adivinarlo con un token bucket a ciegas: se lee.
+//
+// ⚠️ Medido contra demo el 4-ago-2026: **el catálogo va a 5 llamadas por minuto**
+// (`/datetime` a 100). Es poquísimo — elegir un vehículo son 3 llamadas, o sea
+// que un solo PAS consume más de la mitad del minuto. Con esto no alcanza para
+// varios productores en paralelo: es dato duro para negociar el plan productivo.
+
+let cupo: { restante: number; resetAt: number } | null = null;
 
 function sleep(ms: number): Promise<void> {
   return new Promise(r => setTimeout(r, ms));
 }
 
-async function takeToken(): Promise<void> {
-  for (;;) {
-    const now = Date.now();
-    tokens = Math.min(RATE_PER_SEC, tokens + ((now - lastRefill) / 1000) * RATE_PER_SEC);
-    lastRefill = now;
-    if (tokens >= 1) {
-      tokens -= 1;
-      return;
-    }
-    await sleep(Math.ceil((1 - tokens) * (1000 / RATE_PER_SEC)));
+/** Guarda lo que la última respuesta dijo del cupo. */
+function registrarCupo(headers: Headers): void {
+  const restante = headers.get('x-ratelimit-remaining');
+  const reset = headers.get('x-ratelimit-reset');
+  if (restante == null || reset == null) return;
+  cupo = { restante: Number(restante), resetAt: Number(reset) * 1000 };
+}
+
+/**
+ * Si la última respuesta dijo que no queda cupo, espera a que se libere.
+ *
+ * Se prefiere esperar unos segundos antes que comerse un 429: el 429 repetido
+ * es lo que escala a bloqueo de credenciales. Si la espera es larga, se falla
+ * con un mensaje que el PAS entiende en vez de dejar la pantalla colgada.
+ */
+async function esperarCupo(path: string): Promise<void> {
+  if (!cupo || cupo.restante > 0) return;
+  const espera = cupo.resetAt - Date.now();
+  if (espera <= 0) {
+    cupo = null;
+    return;
   }
+  if (espera > MAX_ESPERA_CUPO_MS) {
+    throw new InfoautoError(
+      `Se agotó el cupo de consultas al catálogo. Se libera en ${Math.ceil(espera / 1000)} s.`,
+      path,
+      429,
+    );
+  }
+  await sleep(espera + 250);
+  cupo = null;
 }
 
 // ── Token ────────────────────────────────────────────────────────────────────
@@ -200,16 +253,35 @@ export async function getAccessToken(force = false): Promise<string> {
 
 // ── Request ──────────────────────────────────────────────────────────────────
 
+/** Lo que viene en el header `x-pagination`. */
+interface Pagination {
+  total?: number;
+  total_pages?: number;
+  page?: number;
+  next_page?: number;
+  page_size?: number;
+}
+
+function leerPaginacion(headers: Headers): Pagination | null {
+  const raw = headers.get('x-pagination');
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw) as Pagination;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * GET contra `/{db}/pub`. Reintenta 429 y 5xx; ante 401 renueva el token una
  * vez y repite (el token pudo vencer entre el cache y la llamada).
  */
-async function infoautoGet<T>(path: string): Promise<T> {
+async function pedir<T>(path: string): Promise<{ body: T; pagination: Pagination | null }> {
   const url = `${BASE_URL}/${DB}/pub${path}`;
   let lastErr: InfoautoError | null = null;
 
   for (let intento = 0; intento <= MAX_RETRIES; intento++) {
-    await takeToken();
+    await esperarCupo(path);
     const token = await getAccessToken(intento > 0 && lastErr?.status === 401);
 
     let r: Response;
@@ -227,10 +299,11 @@ async function infoautoGet<T>(path: string): Promise<T> {
       throw lastErr;
     }
 
-    if (r.ok) return (await r.json()) as T;
+    registrarCupo(r.headers);
+    if (r.ok) return { body: (await r.json()) as T, pagination: leerPaginacion(r.headers) };
 
     const body = await r.text().catch(() => '');
-    lastErr = new InfoautoError(`InfoAuto ${r.status}: ${body.slice(0, 200)}`, path, r.status);
+    lastErr = new InfoautoError(mensajeDeError(r.status, body), path, r.status);
 
     // 401 → token vencido, vale un reintento renovando. 429/5xx → esperar.
     const reintentable = r.status === 401 || r.status === 429 || r.status >= 500;
@@ -239,6 +312,42 @@ async function infoautoGet<T>(path: string): Promise<T> {
   }
 
   throw lastErr ?? new InfoautoError('InfoAuto: fallo desconocido.', path, null);
+}
+
+/**
+ * Un 403 acá no es "credenciales mal": es "tu licencia no incluye esto".
+ * Verificado contra demo: los precios (`/models/{codia}/prices/` y
+ * `list_price`) responden 403 mientras el catálogo responde 200.
+ */
+function mensajeDeError(status: number, body: string): string {
+  if (status === 403) return 'La licencia de InfoAuto no incluye este dato.';
+  if (status === 429) return 'Se agotó el cupo de consultas al catálogo. Probá en un minuto.';
+  return `InfoAuto ${status}: ${body.slice(0, 200)}`;
+}
+
+async function infoautoGet<T>(path: string): Promise<T> {
+  return (await pedir<T>(path)).body;
+}
+
+/**
+ * Listado completo, siguiendo la paginación.
+ *
+ * **No es opcional.** La API pagina de a 10 por default: sin esto, `/brands/`
+ * devolvía 10 de 12 marcas y el PAS nunca vería Toyota. Se pide `page_size`
+ * grande para que casi siempre entre en una sola llamada — cada request extra
+ * sale del cupo, que es de 5 por minuto.
+ */
+async function infoautoGetAll<T>(path: string): Promise<T[]> {
+  const out: T[] = [];
+  let page = 1;
+  for (let i = 0; i < MAX_PAGES; i++) {
+    const sep = path.includes('?') ? '&' : '?';
+    const { body, pagination } = await pedir<T[]>(`${path}${sep}page=${page}&page_size=${PAGE_SIZE}`);
+    if (Array.isArray(body)) out.push(...body);
+    if (!pagination?.next_page) break;
+    page = pagination.next_page;
+  }
+  return out;
 }
 
 // ── Tipos de respuesta ───────────────────────────────────────────────────────
@@ -320,7 +429,7 @@ const BAJA_SIN_REASIGNACION = '9999999';
 // ── Catálogo ─────────────────────────────────────────────────────────────────
 
 export async function listarMarcas(): Promise<InfoautoBrand[]> {
-  const raw = await infoautoGet<RawBrand[]>('/brands/');
+  const raw = await infoautoGetAll<RawBrand>('/brands/');
   return raw
     .filter(b => b.id != null)
     .map(b => ({
@@ -333,7 +442,7 @@ export async function listarMarcas(): Promise<InfoautoBrand[]> {
 }
 
 export async function listarGrupos(brandId: number): Promise<InfoautoGroup[]> {
-  const raw = await infoautoGet<RawGroup[]>(`/brands/${brandId}/groups/`);
+  const raw = await infoautoGetAll<RawGroup>(`/brands/${brandId}/groups/`);
   return raw
     .filter(g => g.id != null)
     .map(g => ({
@@ -346,7 +455,7 @@ export async function listarGrupos(brandId: number): Promise<InfoautoGroup[]> {
 }
 
 export async function listarModelos(brandId: number, groupId: number): Promise<InfoautoModel[]> {
-  const raw = await infoautoGet<RawModel[]>(`/brands/${brandId}/groups/${groupId}/models/`);
+  const raw = await infoautoGetAll<RawModel>(`/brands/${brandId}/groups/${groupId}/models/`);
   return raw
     .filter(m => m.codia != null)
     .map(m => ({
@@ -367,11 +476,30 @@ export async function listarModelos(brandId: number, groupId: number): Promise<I
  * y confundirlos infla o desinfla la suma asegurada.
  */
 export async function listarPrecios(codia: string): Promise<InfoautoPrice[]> {
-  const raw = await infoautoGet<RawPrice[]>(`/models/${encodeURIComponent(codia)}/prices/`);
+  const raw = await infoautoGetAll<RawPrice>(`/models/${encodeURIComponent(codia)}/prices/`);
   return raw
     .filter(p => p.year != null && p.price != null)
     .map(p => ({ anio: Number(p.year), precio: Number(p.price) * 1000 }))
     .sort((a, b) => b.anio - a.anio);
+}
+
+/**
+ * Años cotizables del modelo, **sin gastar una llamada**.
+ *
+ * El modelo ya trae `prices_from`/`prices_to` en el listado, así que el rango
+ * sale de ahí. Pedirlo a `/models/{codia}/prices/` sería la fuente exacta —
+ * pero con la licencia de demo eso da 403, y aunque no lo diera costaría una de
+ * las 5 llamadas por minuto para un dato que ya tenemos.
+ *
+ * Devuelve del más nuevo al más viejo: el auto reciente es el caso común.
+ */
+export function aniosDeModelo(m: Pick<InfoautoModel, 'anioDesde' | 'anioHasta'>): number[] {
+  if (m.anioDesde == null || m.anioHasta == null) return [];
+  const desde = Math.min(m.anioDesde, m.anioHasta);
+  const hasta = Math.max(m.anioDesde, m.anioHasta);
+  const out: number[] = [];
+  for (let a = hasta; a >= desde; a--) out.push(a);
+  return out;
 }
 
 /** Un modelo por CODIA — para confirmar que un código tipeado es el auto correcto. */

@@ -546,6 +546,16 @@ function respondeInfoautoError(mod: InfoautoMod, res: Response, err: unknown): v
       .json({ error: 'El catálogo de vehículos está recibiendo demasiadas consultas. Probá en unos segundos.' });
     return;
   }
+  // 403 = el plan no incluye ese dato. Va con marca propia para que el front
+  // pueda seguir sin él en vez de tratarlo como una caída: hoy es el caso de
+  // los precios, que la licencia de demo no habilita.
+  if (mod.isSinLicencia(err)) {
+    res.status(403).json({
+      error: 'La valuación no viene incluida en el plan de InfoAuto contratado.',
+      sinLicencia: true,
+    });
+    return;
+  }
   res.status(502).json({ error: `No se pudo consultar el catálogo de vehículos: ${(err as Error).message}` });
 }
 
@@ -595,7 +605,12 @@ quotesRouter.get(
       // Los dados de baja se devuelven igual, marcados: una póliza vieja puede
       // seguir apuntando a un CODIA que salió del padrón, y ocultarlo dejaría al
       // PAS sin poder recotizarla.
-      res.json({ data: modelos });
+      //
+      // Los años van acá y no en una llamada aparte: salen del rango que el
+      // propio modelo ya trae. El endpoint de precios sería la fuente exacta,
+      // pero da 403 con la licencia de demo y además costaría una de las 5
+      // llamadas por minuto que permite el cupo.
+      res.json({ data: modelos.map(m => ({ ...m, anios: mod.aniosDeModelo(m) })) });
     } catch (err) {
       respondeInfoautoError(mod, res, err);
     }
